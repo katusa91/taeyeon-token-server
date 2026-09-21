@@ -273,6 +273,7 @@
   let sttOpen = false;
   let STT_MODEL = null;
   let sttReconnectAttempts = 0;
+  const STT_RECONNECT_DELAYS_MS = [0, 300, 900]; // Live 소켓과 동일한 취지: 첫 시도는 바로, 실패 반복 시에만 늘림
   let pendingStt = null;     // 무중단 교체용으로 미리 열어둔 새 STT 소켓
   let lastInterimAt = 0;     // 내가 말하는 중에 STT 소켓을 갈아타지 않기 위한 표시
   let pendingUserText = '';
@@ -688,11 +689,45 @@
   // 오디오 출력 컨텍스트는 사용자 제스처(클릭/엔터) 안에서 만들어야 브라우저 자동재생 정책에 안 걸린다.
   // 마이크 버튼뿐 아니라 텍스트 전송(버튼 클릭/엔터)도 사용자 제스처이므로 여기서도 준비해준다.
   function ensureOutputCtx() {
-    if (outputCtx) return outputCtx;
+    if (outputCtx && outputCtx.state !== 'closed') return outputCtx;
     outputCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 24000 });
     const c = outputCtx;
     c.onstatechange = () => console.log('[디버그] outputCtx 상태 변화:', c.state);
     return outputCtx;
+  }
+
+  // ---------- 연결 끊김/재연결 알림음 (짧은 비프음, 태연의 목소리와 같은 출력 경로를 쓰되 별도 노드로 재생) ----------
+  function playTone(ctx, freq, offsetSec, durSec, gainPeak = 0.16) {
+    const t0 = ctx.currentTime + offsetSec;
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.type = 'sine';
+    osc.frequency.setValueAtTime(freq, t0);
+    gain.gain.setValueAtTime(0, t0);
+    gain.gain.linearRampToValueAtTime(gainPeak, t0 + 0.02);
+    gain.gain.linearRampToValueAtTime(0, t0 + durSec);
+    osc.connect(gain).connect(ctx.destination);
+    osc.start(t0);
+    osc.stop(t0 + durSec + 0.03);
+  }
+  function playDisconnectAlert(isFinal) {
+    try {
+      const ctx = ensureOutputCtx();
+      if (ctx.state === 'suspended') ctx.resume().catch(() => {});
+      if (isFinal) { // 재연결 완전 실패 - 낮은 음 3번 (더 확실한 경고)
+        playTone(ctx, 392, 0, 0.16); playTone(ctx, 330, 0.18, 0.16); playTone(ctx, 262, 0.36, 0.3);
+      } else { // 일반 끊김 - 짧게 두 번 하강
+        playTone(ctx, 660, 0, 0.14); playTone(ctx, 440, 0.16, 0.2);
+      }
+    } catch (e) { console.warn('[디버그] 알림음 재생 실패:', e); }
+  }
+  function playReconnectedChime() {
+    try {
+      const ctx = ensureOutputCtx();
+      if (ctx.state === 'suspended') ctx.resume().catch(() => {});
+      playTone(ctx, 523.25, 0, 0.1, 0.13);   // C5
+      playTone(ctx, 783.99, 0.09, 0.16, 0.13); // G5
+    } catch (e) { console.warn('[디버그] 알림음 재생 실패:', e); }
   }
 
   // ---------- 텍스트 직접 입력 (응답 모달리티는 항상 AUDIO라서, 글로 물어봐도 태연은 목소리로 답한다) ----------
@@ -833,13 +868,15 @@
         sttReconnectAttempts++;
         // 재연결되는 동안 마이크 소리는 버려지므로(sttOpen=false) 화면에도 알려둔다
         if (micOn) setStatus('', '음성 인식 다시 연결하는 중…');
+        const delay = STT_RECONNECT_DELAYS_MS[Math.min(sttReconnectAttempts - 1, STT_RECONNECT_DELAYS_MS.length - 1)];
         setTimeout(async () => {
           try { connectStt(await fetchSttToken()); }
           catch (err) { addSystemLine('음성 인식 재연결에 실패했어요. 새로고침 해주세요.'); }
-        }, 500 * sttReconnectAttempts); // 점점 늘어나는 간격 (폭주 방지)
+        }, delay);
       } else {
         setStatus('', '음성 인식 연결 종료됨');
         addSystemLine('음성 인식이 여러 번 끊겨서 새로고침이 필요해요.');
+        playDisconnectAlert(true);
       }
     };
   }
@@ -858,6 +895,9 @@
   let goAwayTimer = null;
   let contextLost = false;   // 재개에 실패해 새 세션으로 시작한 경우
   let flushRetry = 0;
+  // 예기치 않게 끊겼을 때 재연결까지의 대기시간 - 첫 시도는 지체 없이 바로 시도하고,
+  // 같은 이유로 또 실패할 때만 점점 늘려서 서버에 폭주 요청을 보내지 않게 한다.
+  const LIVE_RECONNECT_DELAYS_MS = [0, 400, 1200];
 
   function parseDurationMs(d) {
     if (typeof d === 'string') { const n = parseFloat(d); return isFinite(n) ? n * 1000 : 10000; }
@@ -952,7 +992,8 @@
         sessionOpen = true;
         updateReady();
         if (!STT_MODE) setStatus('live', '연결됨');
-        addSystemLine(reconnectAttempts > 0 ? '다시 연결됐어요' : '태연과 연결되었어요');
+        if (reconnectAttempts > 0) { addSystemLine('다시 연결됐어요'); playReconnectedChime(); }
+        else addSystemLine('태연과 연결되었어요');
         if (contextLost) { addSystemLine('연결이 새로 시작되어 이전 대화 내용은 이어지지 않았어요'); contextLost = false; }
         reconnectAttempts = 0;
         return;
@@ -1030,13 +1071,14 @@
       if (!STT_MODE && e.code === 1007 && /CONTENT_TYPE_AUDIO/i.test(e.reason || '')) {
         dbgNote('알려진 Gemini Live 버그(1007 CONTENT_TYPE_AUDIO) 감지 - 음성 인식 모드(?stt=1)로 자동 전환합니다');
         addSystemLine('음성 연결에 알려진 문제가 생겨서, 음성 인식 모드로 자동 전환할게요…');
+        playDisconnectAlert();
         orb.classList.remove('on');
         orbWrap.classList.remove('active');
         stopMic();
         try { sessionStorage.setItem('taeyeon_stt_fallback_notice', '1'); } catch (_) {}
         const u = new URL(location.href);
         u.searchParams.set('stt', '1');
-        setTimeout(() => { location.href = u.toString(); }, 1000);
+        setTimeout(() => { location.href = u.toString(); }, 500);
         return;
       }
 
@@ -1057,10 +1099,13 @@
         reconnectAttempts++;
         setStatus('', `재연결 중… (${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS})`);
         addSystemLine('연결이 끊겨서 다시 연결하고 있어요…');
-        setTimeout(reconnectLive, 800 * reconnectAttempts); // 점점 늘어나는 간격 (폭주 방지)
+        playDisconnectAlert();
+        const delay = LIVE_RECONNECT_DELAYS_MS[Math.min(reconnectAttempts - 1, LIVE_RECONNECT_DELAYS_MS.length - 1)];
+        setTimeout(reconnectLive, delay);
       } else {
         setStatus('', '연결 종료됨');
         addSystemLine('여러 번 재연결에 실패했어요. 새로고침 해주세요.');
+        playDisconnectAlert(true);
       }
     };
   }
