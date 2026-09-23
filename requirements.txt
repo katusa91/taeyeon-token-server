@@ -3,3 +3,4 @@ flask-cors
 google-genai>=1.67.0
 gunicorn
 psycopg2-binary
+requests
