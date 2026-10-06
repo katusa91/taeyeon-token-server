@@ -5,3 +5,6 @@ gunicorn
 psycopg2-binary
 requests
 youtube-transcript-api
+yfinance
+pandas
+defusedxml
