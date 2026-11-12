@@ -8,3 +8,4 @@ youtube-transcript-api
 yfinance
 pandas
 defusedxml
+mutagen
