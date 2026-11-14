@@ -8,6 +8,7 @@ song_player.py - /song 폴더 음악 자동 정리 + 곡 재생 도구(play_song
      (이미 정리된 곡은 다시 분석하지 않는다. 파일 이름만 바뀐 곡은 해시로 알아보고 분석 결과를 그대로 옮긴다.)
   2) 모델이 play_song(title, artist, mood) 함수를 부르면 DB에서 곡을 찾는다 (모델 호출 없이 로컬 매칭).
        '태연의 파인 들려줘' -> artist+title / '슬픈 노래' -> mood / '오늘 기분에 맞는 곡' -> 모델이 대화를 보고 mood를 골라 넘김
+       '아무 팝송이나' -> english_only=true (제목이 영어인 곡 중 무작위) / '태연의 아무 팝송이나' -> artist + english_only (그 가수의 영어 제목 곡 중 무작위)
   3) 곡 파일은 서명된 주소(/api/songs/<id>/audio?t=...)로 내려준다 (Range 지원 -> 모바일에서도 이어듣기/탐색 OK).
   4) /song-client.js : 화면(taeyeon-voice.html)에 붙이는 재생기 (재생/정지/잠금화면 컨트롤). /songtest : 단독 테스트 페이지.
 
@@ -114,6 +115,8 @@ PLAY_SONG_DECLARATION = {
         "사용자가 노래를 들려달라거나 틀어달라고 할 때 호출한다 (서버에 올려둔 곡을 재생한다). "
         "'태연의 파인 들려줘' -> artist='태연', title='파인' / '파인 틀어줘' -> title만 / '태연 노래 아무거나' -> artist만 / "
         "'슬픈 노래 틀어줘' -> mood / '오늘 기분에 맞는 곡 들려줘'나 '아무 노래나 틀어줘' 처럼 곡 선택을 맡기는 경우도 해당한다.\n"
+        "'아무 팝송이나 들려줘' -> english_only=true (나머지는 비움) / '태연의 아무 팝송이나' -> artist='태연', english_only=true (제목이 영어인 곡 중에서 고른다).\n"
+        "⚠️ '팝송', '영어 노래'라는 말은 title/artist/mood에 넣지 말고 english_only=true로만 표시할 것.\n"
         "⚠️ 사용자가 특정 곡이나 가수를 말했으면 title/artist에 말한 그대로 옮겨 적고 mood는 넣지 말 것 (한글로 말했어도 그대로 적을 것).\n"
         "⚠️ 곡을 지정하지 않고 기분/분위기만 말했거나 '오늘 기분에 맞는 곡'처럼 선곡을 맡겼다면, 지금 대화 흐름과 상대의 기분을 보고 "
         "mood를 하나 골라 넣을 것. 아무 조건도 없는 '아무 노래나'는 모두 비워도 된다.\n"
@@ -131,6 +134,10 @@ PLAY_SONG_DECLARATION = {
                 "type": "STRING", "enum": MOODS,
                 "description": "곡을 지정하지 않았을 때만: 상대의 기분/요청에 맞는 분위기 하나. 특정 곡·가수를 말했으면 넣지 말 것.",
             },
+            "english_only": {
+                "type": "BOOLEAN",
+                "description": "사용자가 '팝송', '영어 노래', '영어로 된 노래'를 아무거나 틀어달라고 했을 때만 true (제목이 영어인 곡 중에서 고른다). 특정 곡 제목을 말했으면 넣지 말 것.",
+            },
         },
     },
 }
@@ -140,6 +147,7 @@ PROMPT_NOTE = (
     "[노래 재생 - play_song]\n"
     "- play_song 함수가 연결되어 있다. 서버에 올려둔 곡을 상대에게 들려줄 수 있다. 상대가 노래를 틀어달라/들려달라고 하면 호출하고, "
     "곡을 지정하지 않고 기분에 맞는 노래를 맡기면 지금 대화의 분위기를 보고 mood를 골라서 호출할 것\n"
+    "- '아무 팝송이나'처럼 팝송/영어 노래를 아무거나 요청하면 english_only=true로 호출할 것 (가수를 말했으면 artist도 같이). '팝송'을 title에 넣지 말 것\n"
     "- 노래를 들려주는 척만 하거나 곡 제목·가사를 지어내지 말 것. 결과가 found:false면 그 사실 그대로 말할 것\n"
     "- 곡은 네 대답이 끝난 뒤 자동으로 재생되니, 대답은 곡 소개 한두 문장으로 짧게 끝낼 것. 곡이 나오는 동안 상대가 '그만'이라고 하면 멈춘다"
 )
@@ -151,6 +159,8 @@ if FILE_MODE:
         "description": (
             "사용자가 특정 노래를 들려달라거나 틀어달라고 할 때 호출한다 (서버에 올려둔 곡 중에서 가수·제목으로 찾아 재생한다). "
             "'태연의 파인 들려줘' -> artist='태연', title='파인' / '파인 틀어줘' -> title만 / '태연 노래 아무거나' -> artist만 / '아무 노래나 틀어줘' -> 모두 비움.\n"
+            "'아무 팝송이나 들려줘' -> english_only=true (나머지는 비움) / '태연의 아무 팝송이나' -> artist='태연', english_only=true (제목이 영어인 곡 중에서 고른다).\n"
+            "⚠️ '팝송', '영어 노래'라는 말은 title/artist에 넣지 말고 english_only=true로만 표시할 것.\n"
             "⚠️ 사용자가 말한 가수·제목을 title/artist에 말한 그대로 옮겨 적을 것 (한글로 말했어도 그대로).\n"
             "⚠️ 곡이나 가수를 말하지 않고 기분/분위기만 말했다면(예: '슬픈 노래') 호출하지 말고, 어떤 가수의 어떤 곡을 들려줄지 자연스럽게 물어볼 것 (분위기 정보는 아직 없다).\n"
             "⚠️ 노래 취향 이야기, 노래 추천 질문처럼 '지금 틀어달라'는 뜻이 아니면 호출하지 말 것.\n"
@@ -163,12 +173,14 @@ if FILE_MODE:
             "properties": {
                 "title": {"type": "STRING", "description": "사용자가 이번 발화에서 말한 곡 제목 (말하지 않았으면 이 필드를 넣지 말 것)."},
                 "artist": {"type": "STRING", "description": "사용자가 이번 발화에서 말한 가수 이름 (말하지 않았으면 이 필드를 넣지 말 것)."},
+                "english_only": {"type": "BOOLEAN", "description": "사용자가 '팝송', '영어 노래', '영어로 된 노래'를 아무거나 틀어달라고 했을 때만 true (제목이 영어인 곡 중에서 고른다). 특정 곡 제목을 말했으면 넣지 말 것."},
             },
         },
     }
     PROMPT_NOTE = (
         "[노래 재생 - play_song]\n"
         "- play_song 함수가 연결되어 있다. 상대가 가수나 제목을 말하며 노래를 틀어달라/들려달라고 하면 호출할 것. 분위기만 말하면 호출하지 말고 어떤 곡을 원하는지 물어볼 것\n"
+        "- '아무 팝송이나'처럼 팝송/영어 노래를 아무거나 요청하면 english_only=true로 호출할 것 (가수를 말했으면 artist도 같이). '팝송'을 title에 넣지 말 것\n"
         "- 노래를 들려주는 척만 하거나 곡 제목·가사를 지어내지 말 것. 결과가 found:false면 message에 적힌 문장만 그대로 말하고 다른 곡을 제안하지 말 것\n"
         "- 곡은 네 대답이 끝난 뒤 자동으로 재생되니, 대답은 곡 소개 한 문장으로 짧게 끝낼 것. 곡이 나오는 동안 상대가 '그만'이라고 하면 멈춘다"
     )
@@ -636,6 +648,26 @@ def _public(r):
             "summary": r.get("summary") or ""}
 
 
+_NON_LATIN_RE = re.compile(r"[\u3131-\u318e\uac00-\ud7a3\u3040-\u30ff\u4e00-\u9fff]")   # 한글 / 일본어 / 한자
+_LATIN_RE = re.compile(r"[A-Za-z]")
+
+
+def _display_title(r):
+    return (r.get("title") or r.get("title_ko") or r.get("title_en")
+            or os.path.splitext(os.path.basename(str(r.get("filename") or "")))[0] or "")
+
+
+def _is_english_title(r):
+    """제목이 영어인 곡인가: 제목 전체(괄호 안 포함)에 알파벳이 있고 한글/일본어/한자가 한 글자도 없으면 True.
+    'Spring Day (봄날)', '봄날 (Spring Day)', 'Hello (feat. 태연)'처럼 영어와 한국어가 섞인 제목은 False."""
+    t = _display_title(r).strip()
+    return bool(_LATIN_RE.search(t)) and not _NON_LATIN_RE.search(t)
+
+
+def _truthy(v):
+    return v is True or str(v).strip().lower() in ("1", "true", "yes", "y", "t")
+
+
 def _pick_random(rows):
     """최근에 들은 곡은 뒤로 미루고(전부 최근이면 그중), 나머지에서 무작위."""
     if not rows:
@@ -645,8 +677,9 @@ def _pick_random(rows):
     return random.choice(fresh or rows)
 
 
-def find_song(title="", artist="", mood="", query="", rows=None):
-    """결과: {"status": "found", "row": r, "why": ...} / {"status": "ambiguous"|"none", "candidates": [...], ...}"""
+def find_song(title="", artist="", mood="", query="", rows=None, english=False):
+    """결과: {"status": "found", "row": r, "why": ...} / {"status": "ambiguous"|"none", "candidates": [...], ...}
+    english=True: 제목을 지정하지 않은 요청('아무 팝송이나', '태연의 아무 팝송이나')에서 제목이 영어인 곡만 후보로 삼는다."""
     if rows is None:
         rows = _fetch_all("SELECT * FROM songs WHERE status='ok' ORDER BY id")
     rows = [r for r in rows if r.get("status", "ok") == "ok"]
@@ -654,6 +687,11 @@ def find_song(title="", artist="", mood="", query="", rows=None):
         return {"status": "empty"}
     title, artist, query = str(title or "").strip(), str(artist or "").strip(), str(query or "").strip()
     mood = normalize_mood(mood)
+
+    if english and not (title or query):               # 팝송 요청: 제목이 영어인 곡 중에서만 고른다 (가수를 말했으면 그 가수 곡 중에서)
+        rows = [r for r in rows if _is_english_title(r)]
+        if not rows:
+            return {"status": "none", "candidates": [], "english": True}
 
     if title or artist or query:
         best_all = []
@@ -781,11 +819,13 @@ def register(app, require_auth, secret, gemini_client):
     def song_play():
         """play_song 함수 호출 처리. body: {title, artist, mood, query}. 모델 호출 없음."""
         data = request.get_json(force=True, silent=True) or {}
+        english = _truthy(data.get("english_only"))
+        english_pick = english and not (str(data.get("title") or "").strip() or str(data.get("query") or "").strip())
         try:
             if FILE_MODE:
-                res = find_song(data.get("title"), data.get("artist"), "", data.get("query"), rows=_rows_for_search())   # 분위기 정보가 없어 mood는 쓰지 않는다
+                res = find_song(data.get("title"), data.get("artist"), "", data.get("query"), rows=_rows_for_search(), english=english)   # 분위기 정보가 없어 mood는 쓰지 않는다
             else:
-                res = find_song(data.get("title"), data.get("artist"), data.get("mood"), data.get("query"))
+                res = find_song(data.get("title"), data.get("artist"), data.get("mood"), data.get("query"), english=english)
         except Exception as e:  # noqa: BLE001
             logging.warning("[song] 곡 찾기 실패: %s", e)
             return jsonify({"found": False, "reason": "error", "message": "지금은 곡을 찾지 못했어요."})
@@ -801,6 +841,8 @@ def register(app, require_auth, secret, gemini_client):
         if st == "none":
             out = {"found": False, "reason": "not_found",
                    "message": "그 곡은 아직 없어요. 없다고 솔직하게 말하고, 지어내지 말 것."}
+            if english_pick:
+                out["message"] = "영어 제목의 곡이 아직 없어요. 없다고 솔직하게 말하고, 지어내지 말 것."
             if res.get("candidates"):
                 out["same_artist_songs"] = [{"title": c["title"], "artist": c["artist"]} for c in res["candidates"]]
                 out["message"] += " same_artist_songs가 있으면 그중 하나를 제안해도 좋다."
@@ -823,6 +865,8 @@ def register(app, require_auth, secret, gemini_client):
                     "가사나 곡 정보를 지어내지 말 것. 재생 주소 같은 건 말하지 말 것.")
         if why.startswith("mood_near"):
             note += " 요청한 분위기의 곡이 없어서 가까운 분위기의 곡을 골랐다는 점을 자연스럽게 짚어도 좋다."
+        if english_pick:
+            note += " 제목이 영어인 곡 중에서 무작위로 골랐다."
         return jsonify({
             "found": True, "song": pub, "why": why, "note": note,
             "play": {**pub, "url": _sign_url(row["id"], row["filename"] if FILE_MODE else None), "duration": row.get("duration_sec")},
