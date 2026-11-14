@@ -1,0 +1,159 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<meta name="robots" content="noindex,nofollow">
+<title>설정 — 어드민</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Noto+Serif+KR:wght@400;600;700&family=Pretendard:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --plum-deep: #1c1220; --plum-mid: #2c1d33; --violet: #4a2f52;
+    --gold: #cf9b4e; --gold-soft: #e8c78a; --rose: #c07b7f;
+    --cream: #f1e7dc; --cream-dim: #b7a99a; --danger: #a85a4f;
+  }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body {
+    margin: 0; padding: 0; min-height: 100%;
+    background: radial-gradient(ellipse at 50% -10%, var(--plum-mid), var(--plum-deep) 60%) fixed;
+    color: var(--cream);
+    font-family: 'Pretendard', -apple-system, 'Apple SD Gothic Neo', 'Noto Sans KR', sans-serif;
+  }
+  #page {
+    max-width: 480px; margin: 0 auto; min-height: 100dvh;
+    padding: calc(14px + env(safe-area-inset-top)) calc(16px + env(safe-area-inset-right)) calc(28px + env(safe-area-inset-bottom)) calc(16px + env(safe-area-inset-left));
+  }
+  #top { display: flex; align-items: center; gap: 10px; margin-bottom: 18px; }
+  #back {
+    display: inline-flex; align-items: center; gap: 4px; color: var(--cream-dim); text-decoration: none;
+    font-size: 13px; padding: 8px 10px 8px 4px; border-radius: 10px;
+  }
+  #back:active { background: rgba(255,255,255,0.06); }
+  #back svg { width: 16px; height: 16px; }
+  h1 { margin: 0; font-family: 'Noto Serif KR', serif; font-size: 20px; color: var(--gold-soft); font-weight: 600; }
+  .card {
+    background: var(--plum-mid); border: 1px solid rgba(232,199,138,0.18); border-radius: 18px;
+    padding: 6px 18px 8px; margin-bottom: 14px;
+  }
+  .card h2 { font-size: 13px; font-weight: 600; color: var(--cream-dim); letter-spacing: .02em; margin: 14px 0 2px; }
+  .card .note { font-size: 12px; line-height: 1.55; color: var(--cream-dim); margin: 0 0 8px; }
+  .row { display: flex; align-items: center; gap: 12px; padding: 12px 0; border-top: 1px solid rgba(232,199,138,0.1); }
+  .row:first-of-type { border-top: 0; }
+  .row .meta { flex: 1; min-width: 0; }
+  .row .label { font-size: 14.5px; color: var(--cream); }
+  .row .hint { font-size: 11.5px; line-height: 1.45; color: var(--cream-dim); margin-top: 2px; }
+  .row.unavailable .label, .row.unavailable .hint { opacity: 0.5; }
+  .row input[type=checkbox] {
+    appearance: none; -webkit-appearance: none; flex: none; width: 44px; height: 26px; border-radius: 13px;
+    background: #4a3b52; position: relative; cursor: pointer; transition: background .15s; margin: 0;
+  }
+  .row input[type=checkbox]::after {
+    content: ''; position: absolute; top: 3px; left: 3px; width: 20px; height: 20px; border-radius: 50%;
+    background: var(--cream); transition: transform .15s;
+  }
+  .row input[type=checkbox]:checked { background: var(--gold); }
+  .row input[type=checkbox]:checked::after { transform: translateX(18px); }
+  .row input[type=checkbox]:disabled { opacity: 0.45; cursor: default; }
+  #msg { font-size: 12.5px; line-height: 1.55; color: var(--cream-dim); min-height: 20px; padding: 0 4px; }
+  #msg.err { color: var(--rose); }
+  #msg a { color: var(--gold-soft); }
+  .loading { padding: 18px 0; font-size: 13px; color: var(--cream-dim); }
+</style>
+</head>
+<body>
+<div id="page">
+  <div id="top">
+    <a id="back" href="/pipe" aria-label="대화 화면으로 돌아가기">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 18 9 12 15 6"></polyline></svg>
+      돌아가기
+    </a>
+    <h1>설정</h1>
+  </div>
+
+  <div class="card">
+    <h2>도구 켜고 끄기</h2>
+    <p class="note">바꾸면 바로 저장돼요. 대화 화면에서는 다음 말부터 적용돼요. 위치를 쓰는 기능을 모두 끄면 위치 권한도 요청하지 않아요.</p>
+    <div id="toolList"><div class="loading">불러오는 중…</div></div>
+  </div>
+  <div id="msg" role="status" aria-live="polite"></div>
+</div>
+<script>
+(() => {
+  'use strict';
+  const AUTH_TOKEN_KEY = 'taeyeon_auth_token';   // 대화 화면과 같은 키 -> 거기서 로그인했으면 여기서도 유지됨
+  let authToken = null;
+  try { authToken = localStorage.getItem(AUTH_TOKEN_KEY); } catch (_) {}
+  const authHeaders = () => (authToken ? { Authorization: 'Bearer ' + authToken } : {});
+  const listEl = document.getElementById('toolList');
+  const msgEl = document.getElementById('msg');
+  let persistNoted = false;
+
+  function say(text, isErr) { msgEl.className = isErr ? 'err' : ''; msgEl.textContent = text || ''; }
+  function needLogin() {
+    listEl.textContent = '';
+    msgEl.className = 'err'; msgEl.textContent = '';
+    msgEl.append('로그인이 필요해요. ');
+    const a = document.createElement('a'); a.href = '/pipe'; a.textContent = '대화 화면';
+    msgEl.append(a, '에서 로그인한 뒤 다시 열어주세요.');
+  }
+
+  function render(list) {
+    listEl.textContent = '';
+    for (const t of list) {
+      const row = document.createElement('label'); row.className = 'row' + (t.available ? '' : ' unavailable');
+      const meta = document.createElement('div'); meta.className = 'meta';
+      const lab = document.createElement('div'); lab.className = 'label'; lab.textContent = t.label;
+      const hint = document.createElement('div'); hint.className = 'hint';
+      hint.textContent = t.available ? t.hint : '서버에 키/설정이 없어서 켤 수 없어요';
+      meta.append(lab, hint);
+      const cb = document.createElement('input'); cb.type = 'checkbox'; cb.checked = !!t.enabled; cb.disabled = !t.available;
+      cb.addEventListener('change', () => save(t.name, cb.checked, cb));
+      row.append(meta, cb); listEl.append(row);
+    }
+  }
+
+  async function load() {
+    try {
+      const res = await fetch('/api/pipe/toggles', { headers: authHeaders() });
+      if (res.status === 401) { needLogin(); return; }
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      render((await res.json()).toggles || []);
+    } catch (e) {
+      listEl.textContent = '';
+      say('설정을 불러오지 못했어요: ' + (e && e.message ? e.message : e), true);
+    }
+  }
+
+  async function save(name, enabled, cb) {
+    cb.disabled = true; say('');
+    try {
+      const res = await fetch('/api/pipe/toggles', {
+        method: 'POST', headers: { 'Content-Type': 'application/json', ...authHeaders() },
+        body: JSON.stringify({ name, enabled }),
+      });
+      if (res.status === 401) { needLogin(); return; }
+      const d = await res.json().catch(() => ({}));
+      if (Array.isArray(d.toggles)) render(d.toggles);
+      if (!res.ok) { say(d.error || ('저장하지 못했어요 (HTTP ' + res.status + ')'), true); if (!Array.isArray(d.toggles)) { cb.checked = !enabled; cb.disabled = false; } return; }
+      if (d.persisted === false && !persistNoted) {
+        persistNoted = true;
+        say('바뀌었지만 DB에 저장하지 못했어요. 서버를 다시 시작하면 원래대로 돌아와요.', true);
+      } else {
+        say('저장했어요.');
+        setTimeout(() => { if (msgEl.textContent === '저장했어요.') say(''); }, 1500);
+      }
+    } catch (e) {
+      cb.checked = !enabled; cb.disabled = false;
+      say('저장하지 못했어요: ' + (e && e.message ? e.message : e), true);
+    }
+  }
+
+  // 대화 화면에서 뒤로가기로 오거나, 다른 탭에서 바꾼 뒤 돌아왔을 때 최신 값으로
+  window.addEventListener('pageshow', (e) => { if (e.persisted) load(); });
+  document.addEventListener('visibilitychange', () => { if (!document.hidden) load(); });
+  load();
+})();
+</script>
+</body>
+</html>
