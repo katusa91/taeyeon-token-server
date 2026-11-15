@@ -1,0 +1,119 @@
+--- song_player_prev2.py	2026-11-15 01:13:15.427626514 +0000
++++ song_player.py	2026-11-15 01:13:35.244144626 +0000
+@@ -1065,9 +1065,9 @@
+     @app.post("/api/songs/upload")
+     @require_auth
+     def songs_upload():
+-        """신곡 등록. multipart/form-data: artist, title, review(감상평), mood(선택), folder(선택), size(바이트, 선택),
++        """신곡 등록. multipart/form-data: artist, title, review(감상평), mood(선택), folder(선택),
+         file(mp3) 또는 server_path(서버에 이미 있는 파일/폴더 경로), overwrite(1이면 같은 이름을 덮어씀).
+-        파일을 SONG_DIR 에 '가수 - 곡명.확장자'로 저장하고 DB(songs)에도 등록한다."""
++        파일을 SONG_DIR 에 '가수 - 곡명.확장자'로 저장하고 DB(songs)에도 등록한다. 파일 크기는 입력받지 않고 서버가 저장한 파일에서 직접 계산해 DB에 넣는다."""
+         if not ENABLED:
+             return _upload_error("곡 기능이 꺼져 있어요", 503)
+         fm = request.form
+@@ -1081,10 +1081,6 @@
+             return _upload_error("분위기는 %s 중 하나여야 해요" % ", ".join(MOODS))
+         folder = _safe_folder(fm.get("folder"))
+         overwrite = _truthy(fm.get("overwrite"))
+-        try:
+-            want_size = int(str(fm.get("size") or "0").strip() or 0)
+-        except ValueError:
+-            want_size = 0
+         max_bytes = SONG_UPLOAD_MAX_MB * 1024 * 1024
+         up = request.files.get("file")
+         server_path = str(fm.get("server_path") or "").strip()
+@@ -1131,14 +1127,10 @@
+                         raise ValueError("빈 파일이에요")
+                     if size > max_bytes:
+                         raise ValueError("파일이 너무 커요 (최대 %dMB)" % SONG_UPLOAD_MAX_MB)
+-                    if want_size and want_size != size:
+-                        raise ValueError("파일 크기가 달라요 (입력/선택한 크기 %d바이트, 서버에 받은 크기 %d바이트). 다시 올려 주세요" % (want_size, size))
+                     os.replace(tmp, dest)
+                     tmp = None
+                 else:
+                     size = os.path.getsize(dest)
+-                    if want_size and want_size != size:
+-                        raise ValueError("파일 크기가 달라요 (입력한 크기 %d바이트, 서버 파일 %d바이트)" % (want_size, size))
+             except ValueError as e:
+                 return _upload_error(str(e))
+             except Exception as e:  # noqa: BLE001
+@@ -1337,15 +1329,18 @@
+ <div class="row"><input id="n_review" placeholder="감상평 (한두 문장)"></div>
+ <div class="row"><select id="n_mood"><option value="">분위기 (선택)</option></select><input id="n_folder" placeholder="저장 하위 폴더 (선택, 예: 태연)"></div>
+ <div class="row" id="n_drop" style="border:1px dashed var(--line);border-radius:8px;padding:8px;align-items:center">
+-<input id="n_file" type="file" accept=".mp3,.m4a,.wav,.ogg,.flac,audio/*" style="flex:2;border:0;padding:0">
+-<input id="n_size" placeholder="파일 크기" readonly style="flex:1;min-width:90px"></div>
+-<div class="mut">내 PC의 경로를 글자로 적어서는 브라우저가 파일을 읽을 수 없어요. 위 칸에서 파일을 고르거나 끌어다 놓으면 파일 이름·크기가 자동으로 채워져요.</div>
++<input id="n_file" type="file" accept=".mp3,.m4a,.wav,.ogg,.flac,audio/*" style="flex:1;border:0;padding:0"></div>
++<div class="mut">내 PC의 경로를 글자로 적어서는 브라우저가 파일을 읽을 수 없어요. 위 칸에서 파일을 고르거나 끌어다 놓으세요. 파일 이름이 '가수 - 곡명.mp3' 꼴이면 가수·곡명이 자동으로 채워지고, 파일 크기는 서버가 직접 계산해서 저장해요.</div>
+ <div class="row"><input id="n_spath" placeholder="(선택) 서버에 이미 있는 파일/폴더 경로 - 파일을 안 고르면 이 경로에서 찾아요"></div>
+ <div class="row"><button class="p" id="n_go" onclick="addSong()">등록</button><button onclick="toggleAdd()">닫기</button><span class="mut" id="n_msg"></span></div>
+ </div>
+ <div class="mut" id="meta"></div>
+ <div class="tbl"><table id="tb"><thead><tr><th>가수</th><th>제목</th><th>분위기</th><th>E</th><th>상태</th><th></th></tr></thead><tbody></tbody></table></div>
+ <div id="log"></div>
++<div id="dlg" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.5);z-index:50;align-items:center;justify-content:center;padding:16px">
++<div role="alertdialog" aria-modal="true" aria-labelledby="dlg_msg" style="background:var(--bg);color:var(--fg);border:1px solid var(--line);border-radius:12px;padding:16px;max-width:380px;width:100%;box-shadow:0 10px 30px rgba(0,0,0,.35)">
++<div id="dlg_msg" style="white-space:pre-line;margin-bottom:14px"></div>
++<div style="display:flex;gap:8px;justify-content:flex-end"><button id="dlg_no">취소</button><button id="dlg_ok" class="p">확인</button></div></div></div>
+ <script src="/song-client.js"></script>
+ <script>
+ var $=function(i){return document.getElementById(i)}, tok=localStorage.getItem('songtest_tok')||'';
+@@ -1375,20 +1370,29 @@
+     var b=document.createElement('button');b.textContent='▶';b.onclick=function(){playBody({title:t,artist:r.artist||''})};c[5].appendChild(b);
+     var del=document.createElement('button');del.textContent='삭제';del.style.marginLeft='6px';del.onclick=function(){delSong(r,t,del)};c[5].appendChild(del);
+     tb.appendChild(tr)})}).catch(function(e){log(e.message)})}
++function askConfirm(msg,okLabel,danger){return new Promise(function(res){
++  var d=$('dlg'),ok=$('dlg_ok'),no=$('dlg_no');$('dlg_msg').textContent=msg;ok.textContent=okLabel||'확인';
++  ok.style.background=danger?'#d63031':'';ok.style.borderColor=danger?'#d63031':'';
++  d.style.display='flex';no.focus();
++  function done(v){d.style.display='none';ok.onclick=no.onclick=d.onclick=null;document.removeEventListener('keydown',key);res(v)}
++  function key(e){if(e.key==='Escape')done(false)}
++  ok.onclick=function(){done(true)};no.onclick=function(){done(false)};
++  d.onclick=function(e){if(e.target===d)done(false)};document.addEventListener('keydown',key)})}
+ function delSong(r,t,btn){
+-  if(!confirm('"'+(r.artist?r.artist+' - ':'')+t+'" 곡을 삭제할까요?\n서버 폴더의 파일과 DB 정보가 모두 지워지고, 되돌릴 수 없어요.'))return;
++  askConfirm('"'+(r.artist?r.artist+' - ':'')+t+'" 곡을 삭제할까요?\n\n서버 폴더의 파일과 DB 정보가 모두 지워지고, 되돌릴 수 없어요.','삭제',true).then(function(yes){
++  if(!yes){log('삭제를 취소했어요');return}
+   btn.disabled=true;btn.textContent='삭제 중...';
+-  api('/api/songs/'+r.id+'/delete',{filename:r.filename}).then(function(d){
++  return api('/api/songs/'+r.id+'/delete',{filename:r.filename}).then(function(d){
+     if(d.ok||d.gone){if(curId===r.id)SongPlayer.stop();
+       log('삭제 완료 '+(d.filename||t)+(d.ok?' / 파일 '+(d.file.deleted?'삭제':d.file.note)+' / DB '+(d.db.deleted?'삭제':d.db.note):' (이미 없는 곡)'))}
+     else{log('삭제 실패: '+(d.error||[d.file&&d.file.note,d.db&&d.db.note].filter(Boolean).join(' / ')))}
+-    load()}).catch(function(e){log('삭제 실패: '+e.message);load()})}
++    load()}).catch(function(e){log('삭제 실패: '+e.message);load()})})}
+ function scan(){api('/api/songs/scan',{}).then(function(d){log(JSON.stringify(d));setTimeout(load,3000);var n=0;var iv=setInterval(function(){load();if(++n>40)clearInterval(iv)},8000)}).catch(function(e){log(e.message)})}
+ 
+ function toggleAdd(){var b=$('addbox');b.style.display=b.style.display==='none'?'block':'none';
+   var s=$('n_mood');if(s.options.length<2)['기쁨','신남','설렘','잔잔함','그리움','슬픔','위로'].forEach(function(m){var o=document.createElement('option');o.value=o.textContent=m;s.appendChild(o)})}
+ function fmtSize(n){return n>=1048576?(n/1048576).toFixed(2)+'MB ('+n+'바이트)':(n/1024).toFixed(1)+'KB ('+n+'바이트)'}
+-function pickFile(f){if(!f)return;$('n_size').value=fmtSize(f.size);$('n_size').dataset.bytes=f.size;
++function pickFile(f){if(!f)return;
+   var st=f.name.replace(/\.[^.]+$/,'').replace(/^\s*\d{1,3}\s*[.\-_)]\s*/,'').replace(/_/g,' ').trim(),m=st.match(/^(.+?)\s+-\s+(.+)$/);
+   if(!$('n_artist').value&&m)$('n_artist').value=m[1].trim();if(!$('n_title').value)$('n_title').value=m?m[2].trim():st}
+ $('n_file').addEventListener('change',function(){pickFile(this.files[0])});
+@@ -1401,18 +1405,18 @@
+   fd.append('artist',$('n_artist').value);fd.append('title',$('n_title').value);fd.append('review',$('n_review').value);
+   fd.append('mood',$('n_mood').value);fd.append('folder',$('n_folder').value);fd.append('server_path',$('n_spath').value);
+   if(overwrite===true)fd.append('overwrite','1');
+-  if(f){fd.append('file',f);fd.append('size',f.size)}
++  if(f)fd.append('file',f);
+   var x=new XMLHttpRequest();x.open('POST','/api/songs/upload');if(tok)x.setRequestHeader('Authorization','Bearer '+tok);
+   $('n_go').disabled=true;msg.textContent='올리는 중...';
+   x.upload.onprogress=function(e){if(e.lengthComputable)msg.textContent='올리는 중 '+Math.round(e.loaded/e.total*100)+'%'};
+   x.onload=function(){$('n_go').disabled=false;var d={};try{d=JSON.parse(x.responseText)}catch(_){}
+     if(x.status===401){$('auth').style.display='flex';msg.textContent='로그인 필요(401)';return}
+     if(x.status===413){msg.textContent='파일이 서버 제한을 넘었어요';log('등록 실패: 파일이 서버 업로드 제한보다 커요');return}
+-    if(x.status===409&&d.exists){if(confirm('같은 이름의 곡이 이미 있어요:\n'+d.filename+'\n덮어쓸까요?'))addSong(true);else msg.textContent='취소했어요';return}
++    if(x.status===409&&d.exists){msg.textContent='같은 이름의 곡이 있어요';askConfirm('같은 이름의 곡이 이미 있어요:\n'+d.filename+'\n\n덮어쓸까요?','덮어쓰기',true).then(function(yes){if(yes)addSong(true);else msg.textContent='취소했어요'});return}
+     if(!d.ok){msg.textContent=d.error||('실패('+x.status+')');log('등록 실패: '+(d.error||x.status));return}
+-    msg.textContent='등록 완료: '+d.filename;
++    msg.textContent='등록 완료: '+d.filename+' ('+fmtSize(d.size)+')';
+     log('등록 완료 '+d.filename+' ('+fmtSize(d.size)+') / DB '+(d.db.saved?'저장 id='+d.db.id:(d.db.note||'안 함'))+(d.warnings&&d.warnings.length?' / 주의: '+d.warnings.join(', '):''));
+-    $('n_file').value='';$('n_size').value='';$('n_title').value='';$('n_review').value='';$('n_spath').value='';load()};
++    $('n_file').value='';$('n_title').value='';$('n_review').value='';$('n_spath').value='';load()};
+   x.onerror=function(){$('n_go').disabled=false;msg.textContent='네트워크 오류'};
+   x.send(fd)}
+ load();

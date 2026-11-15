@@ -1,0 +1,126 @@
+--- token_server_prev.py	2026-11-15 01:14:23.509305267 +0000
++++ token_server.py	2026-11-15 01:14:23.530322449 +0000
+@@ -6753,6 +6753,96 @@
+     return "\n\n".join(parts), ""
+ 
+ 
++# ----- 화면의 '타로' 버튼: 오늘의 타로 카드 한 장 (카드는 서버가 뽑고, 모델은 그 카드의 풀이만 한다) -----
++#   PIPE_QUICK_TAROT=0 : 끔 (기본 켜짐). 끄면 버튼 문장을 평소 대화처럼 모델이 처리한다
++#   카드는 '오늘 날짜(KST) + 사용자'로 정해져서, 하루 동안은 몇 번을 눌러도 같은 카드가 나온다 (모델이 매번 다른 카드를 지어내지 않게).
++#   78장(메이저 22 + 마이너 56)에 정방향/역방향이 있다. 화면에는 카드 그림(tarot 이벤트), 목소리/글자로는 풀이가 나간다.
++PIPE_QUICK_TAROT = os.environ.get("PIPE_QUICK_TAROT", "1").strip() != "0"
++_TAROT_MAJOR = [
++    ("바보", "The Fool", "새로운 시작·모험·순수한 자유", "무모함·준비 부족·망설임"),
++    ("마법사", "The Magician", "의지·재능 발휘·실행력", "속임수·재능 낭비·집중력 부족"),
++    ("여사제", "The High Priestess", "직관·고요한 통찰·숨은 진실", "숨겨진 정보·직관 무시·답답한 침묵"),
++    ("여황제", "The Empress", "풍요·돌봄·사랑과 창조", "과잉보호·창작의 정체·의존"),
++    ("황제", "The Emperor", "질서·책임·안정된 리더십", "독선·경직·통제욕"),
++    ("교황", "The Hierophant", "전통·좋은 조언·배움", "고정관념·형식에 얽매임·반항"),
++    ("연인", "The Lovers", "사랑·조화·중요한 선택", "엇갈림·불균형·선택을 미룸"),
++    ("전차", "The Chariot", "승리·추진력·자기 통제", "폭주·방향 상실·좌절"),
++    ("힘", "Strength", "용기·부드러운 인내·내면의 힘", "자신감 저하·인내의 한계·감정 폭발"),
++    ("은둔자", "The Hermit", "성찰·혼자만의 시간·내면의 길잡이", "고립·외로움·회피"),
++    ("운명의 수레바퀴", "Wheel of Fortune", "전환점·행운의 흐름·변화", "흐름의 정체·타이밍 어긋남·불운"),
++    ("정의", "Justice", "공정·균형·합리적 판단", "불공정·편견·책임 회피"),
++    ("매달린 사람", "The Hanged Man", "멈춤·관점 전환·기다림의 가치", "헛된 희생·미련·정체"),
++    ("죽음", "Death", "끝과 새 출발·정리·변화", "변화에 대한 저항·미련·정체"),
++    ("절제", "Temperance", "조화·균형·치유", "불균형·과함·조급함"),
++    ("악마", "The Devil", "집착·유혹·얽매임", "속박에서 벗어남·자각·집착 내려놓기"),
++    ("탑", "The Tower", "갑작스러운 변화·충격·깨달음", "위기 모면·변화 거부·내적 붕괴"),
++    ("별", "The Star", "희망·치유·영감", "희망 상실·낙담·불안"),
++    ("달", "The Moon", "불안·모호함·무의식", "불안 해소·진실이 드러남·혼란 정리"),
++    ("태양", "The Sun", "기쁨·성공·활력", "일시적 우울·낙관 과잉·미뤄진 기쁨"),
++    ("심판", "Judgement", "부활·각성·결단", "자책·망설임·미련으로 인한 정체"),
++    ("세계", "The World", "완성·성취·새 단계로의 마무리", "마무리 부족·미완·한 발 모자람"),
++]
++_TAROT_SUITS = [("완드", "Wands", "🔥", "열정·행동·일과 도전"), ("컵", "Cups", "💧", "감정·관계·마음"),
++                ("소드", "Swords", "⚔️", "생각·소통·갈등과 결단"), ("펜타클", "Pentacles", "🪙", "돈·건강·일상과 현실")]
++_TAROT_RANKS = [
++    ("에이스", "Ace", "새로운 시작·가능성의 씨앗", "시작의 지연·기회를 놓침"),
++    ("2", "Two", "선택·균형·계획", "우유부단·균형이 깨짐"),
++    ("3", "Three", "협력·성장·첫 결실", "엇박자·성장의 지연"),
++    ("4", "Four", "안정·휴식·붙잡아 둠", "정체·답답함·변화가 필요함"),
++    ("5", "Five", "갈등·시련·경쟁", "갈등 해소·화해 직전·소모가 이어짐"),
++    ("6", "Six", "회복·조화·나눔", "불균형한 주고받음·회복이 늦어짐"),
++    ("7", "Seven", "도전·점검·버티는 힘", "의욕 저하·방향 재점검이 필요함"),
++    ("8", "Eight", "노력·움직임·집중", "서두름·산만함·지연"),
++    ("9", "Nine", "성취 직전·독립·끈기", "지침·불안·마지막 고비"),
++    ("10", "Ten", "완성·끝맺음·무거운 책임", "부담 해소·과부하"),
++    ("시종", "Page", "호기심·새 소식·배움", "미숙함·소식의 지연"),
++    ("기사", "Knight", "행동력·추진·여정", "성급함·산만함·무모함"),
++    ("여왕", "Queen", "성숙·돌봄·내면의 힘", "변덕·예민함·자기 소모"),
++    ("왕", "King", "통솔·책임·안정된 판단", "독단·권위 남용·냉정함"),
++]
++_TAROT_ROMAN = ["0", "I", "II", "III", "IV", "V", "VI", "VII", "VIII", "IX", "X", "XI", "XII", "XIII", "XIV", "XV", "XVI", "XVII", "XVIII", "XIX", "XX", "XXI"]
++
++
++def _tarot_build_deck():
++    deck = [{"ko": ko, "en": en, "up": up, "rev": rv, "label": "MAJOR " + _TAROT_ROMAN[i], "symbol": "✨", "area": ""}
++            for i, (ko, en, up, rv) in enumerate(_TAROT_MAJOR)]
++    for sko, sen, sym, area in _TAROT_SUITS:
++        for rko, ren, up, rv in _TAROT_RANKS:
++            deck.append({"ko": "%s %s" % (sko, rko), "en": "%s of %s" % (ren, sen), "up": up, "rev": rv,
++                         "label": sen.upper() + " " + (rko if rko.isdigit() else ren.upper()), "symbol": sym, "area": "%s(%s)" % (area, sko)})
++    return deck
++
++
++_TAROT_DECK = _tarot_build_deck()
++_tarot_state = {"day": "", "count": 0}
++_tarot_lock = threading.Lock()
++
++
++def _tarot_today(now=None):
++    """오늘(KST)의 카드 한 장. {card: 화면에 보낼 정보, block: 모델에게 줄 자료 글}. 같은 날은 같은 카드, 날이 바뀌면 새 카드."""
++    day = (now or datetime.datetime.now(KST)).strftime("%Y-%m-%d")
++    h = hashlib.sha256(("%s|%s|tarot" % (day, OWNER_USER_ID if OWNER_USER_ID is not None else "owner")).encode("utf-8")).digest()
++    c = _TAROT_DECK[int.from_bytes(h[:4], "big") % len(_TAROT_DECK)]
++    rev = bool(h[4] & 1)
++    with _tarot_lock:
++        again = _tarot_state["day"] == day and _tarot_state["count"] > 0
++        _tarot_state.update(day=day, count=(_tarot_state["count"] + 1) if again else 1)
++    meaning = c["rev"] if rev else c["up"]
++    card = {"nameKo": c["ko"], "nameEn": c["en"], "reversed": rev, "keywords": meaning, "label": c["label"],
++            "symbol": c["symbol"], "again": again, "date": day}
++    lines = ["[서버가 오늘 뽑은 타로 카드 - 상대가 '타로' 버튼을 눌러 오늘의 카드를 봤다. 화면에는 카드 그림이 이미 떠 있다]",
++             "카드: %s (%s) - %s" % (c["ko"], c["en"], "역방향" if rev else "정방향"),
++             "이번에 나온 방향의 뜻: " + meaning]
++    if c["area"]:
++        lines.append("다루는 영역: " + c["area"])
++    lines.append("위 카드만 근거로, 상대의 '오늘 하루' 흐름과 마음가짐을 말해줘. 카드 이름과 정방향/역방향을 먼저 한마디로 말하고, 키워드를 오늘 하루에 자연스럽게 엮어 "
++                 "서너 문장(20초 안팎)으로 핵심만. 다른 카드를 새로 뽑거나 지어내지 말고, 카드 그림을 묘사하지 않아도 된다. 큰 불행·이별·사고·병 같은 겁주는 예언이나 단정은 하지 말고, "
++                 "역방향이어도 조심할 점과 따뜻한 조언으로 풀어 줄 것. 투자·건강·법률 같은 큰 결정의 근거로 삼으라는 말은 하지 말 것. 함수는 부르지 말 것.")
++    if again:
++        lines.append("오늘 이미 한 번 뽑은 카드라서 같은 카드가 나왔다는 점을 한마디 덧붙일 것.")
++    return {"card": card, "block": "\n".join(lines)}
++
++
+ # ===== 파이프라인 모드 (/pipe) : Gemini Live 없이 '입력(글자/음성) → generateContent → 문장 단위 TTS' =====
+ # 기존 Live 방식(/, /api/token)은 그대로 두고, 별도 페이지(/pipe = taeyeon-pipe.html)에서만 쓴다.
+ #   입력   : 글자 또는 음성 파일(WAV). 음성은 Gemini에 오디오로 직접 넣고, 화면/DB용 받아쓰기는 병렬로 따로 한다.
+@@ -7699,6 +7789,13 @@
+                                  _pipe_executor.submit(_stockbot_ask, q) if _qs_bot_on else _done_future((None, None)),
+                                  _pipe_executor.submit(_selfq_lookup, q) if PIPE_QUICK_STOCK_SELF else None)
+                                 for q in PIPE_QUICK_STOCK_QUERIES]
++        # 화면의 '타로' 버튼(quick=tarot): 서버가 오늘의 카드를 뽑아 화면에 보여주고, 모델에게는 그 카드의 풀이만 맡긴다 (결과는 gen()에서 쓴다)
++        quick_tarot = None
++        if PIPE_QUICK_TAROT and data.get("quick") == "tarot" and not audio_bytes and not img_bytes:
++            try:
++                quick_tarot = _tarot_today()
++            except Exception as e:  # noqa: BLE001
++                logging.warning("[타로] 카드 뽑기 실패 - 평소 대화로 진행: %s", type(e).__name__)
+         # '그만' 같은 말은 대답 모델에 연결하지 않고, 미리 저장해 둔 "알았어." 음성만 내보내고 끝낸다 (대화 기록에도 남기지 않는다)
+         _t_stop0 = time.monotonic()
+         pre_stt = None
+@@ -7835,6 +7932,12 @@
+                     # 주식봇도 자체 조회도 자료를 못 줬다: 오류 안내는 읽지 않고, 모델이 검색으로 찾아 자연스럽게 시황을 말한다
+                     logging.info("[pipe] 주식 버튼: 시세 자료 없음(%s) - 오류 안내 없이 모델이 검색으로 답합니다", _qs_canned or "못 찾음")
+                     contents = _pipe_build_contents(data.get("turns"), list(user_parts) + [T.Part(text=_QUICK_STOCK_SEARCH_HINT)])
++            if quick_tarot:
++                # 화면에 카드를 먼저 보여주고, 모델은 이 카드의 풀이만 한다
++                logging.info("[타로] 오늘의 카드: %s %s%s", quick_tarot["card"]["nameKo"], "역방향" if quick_tarot["card"]["reversed"] else "정방향",
++                             " (이미 뽑은 카드)" if quick_tarot["card"]["again"] else "")
++                yield _pipe_ev({"type": "tarot", "card": quick_tarot["card"]})
++                contents = _pipe_build_contents(data.get("turns"), list(user_parts) + [T.Part(text=quick_tarot["block"])])
+             attempts = []   # (모델, thinking 여부): 주 모델 -> 예비 모델 순. 과부하/404면 그 모델은 건너뛴다
+             for _i, _m in enumerate([PIPE_MODEL] + PIPE_FALLBACK_MODELS):
+                 if _i == 0 and PIPE_THINKING:
