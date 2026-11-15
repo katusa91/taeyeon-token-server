@@ -1,0 +1,108 @@
+--- token_server_prev4.py	2026-11-15 06:40:02.957720748 +0000
++++ token_server.py	2026-11-15 06:40:02.992570326 +0000
+@@ -6544,7 +6544,7 @@
+ # ----- 화면의 '주식' 버튼: 모델에게 맡기지 않고 서버가 주식봇(오라클)에 직접 물어, 지수와 가격 자료를 대답 모델에게 건네준다 -----
+ #   PIPE_QUICK_STOCK=0           : 끔 (기본 켜짐). 끄거나 STOCKBOT_URL/KEY가 없으면 버튼 문장을 평소 대화처럼 모델이 처리한다
+ #   PIPE_QUICK_STOCK_QUERIES     : 주식봇에 물어볼 항목을 쉼표로 (기본 "코스피,코스닥,비트코인"). 항목마다 따로, 동시에 묻는다 (최대 4개)
+-#   주식봇이 응답이 없거나 오류면 서버가 직접 조회(자체 조회)해서 대신하고, 그것마저 안 되면 오류 안내 없이 모델이 검색해서 답한다.
++#   주식봇이 응답이 없거나 오류면 "연결에 문제가 있어 검색기준으로 알려드려요" 한 문장을 먼저 말하고, 서버가 직접 조회(자체 조회)한 자료로 대신하며, 그것마저 안 되면 모델이 검색해서 답한다.
+ PIPE_QUICK_STOCK = os.environ.get("PIPE_QUICK_STOCK", "1").strip() != "0"
+ PIPE_QUICK_STOCK_QUERIES = [q.strip() for q in os.environ.get("PIPE_QUICK_STOCK_QUERIES", "코스피,코스닥,비트코인").split(",") if q.strip()][:4] \
+     or ["코스피", "코스닥", "비트코인"]
+@@ -6554,23 +6554,26 @@
+ #   PIPE_QUICK_STOCK_SELF=0      : 끔 (기본 켜짐). 주식봇(오라클)이 응답이 없거나 오류일 때, 서버가 공개 시세 API로 직접 조회해서 대신한다
+ #   PIPE_QUICK_STOCK_SELF_TIMEOUT: 공개 API 한 곳을 기다리는 시간(초), 기본 4
+ #   PIPE_QUICK_STOCK_ERR_SAY=1   : 주식봇도 자체 조회도 모두 실패했을 때 예전처럼 저장된 오류 안내(stock_down/stock_error)를 읽는다.
+-#                                  기본 0 = 오류 안내는 읽지 않고, 모델이 검색으로 찾아서 자연스럽게 시황을 말한다
++#                                  기본 0 = 저장된 오류 안내 대신 PIPE_QUICK_STOCK_NOTICE 한 문장을 먼저 말하고, 모델이 검색으로 찾아서 시황을 말한다
+ PIPE_QUICK_STOCK_SELF = os.environ.get("PIPE_QUICK_STOCK_SELF", "1").strip() != "0"
+ PIPE_QUICK_STOCK_ERR_SAY = os.environ.get("PIPE_QUICK_STOCK_ERR_SAY", "0").strip() == "1"
+ _SELFQ_TIMEOUT = max(1.0, _env_float_tts("PIPE_QUICK_STOCK_SELF_TIMEOUT", 4))
+ _SELFQ_HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+                   "Accept": "application/json"}
++#   PIPE_QUICK_STOCK_NOTICE      : 주식봇(오라클) 연결이 실패했을 때, 대답 맨 앞에서 서버가 먼저 말하는 안내 한 문장 (모델이 말을 바꾸지 않게 고정 문장으로 보낸다).
++#                                  빈 값으로 두면 안내 없이 바로 답한다. 주식봇이 설정돼 있지 않거나 '못 찾음'일 때는 연결 실패가 아니라서 안내하지 않는다
++_QUICK_STOCK_NOTICE = os.environ.get("PIPE_QUICK_STOCK_NOTICE", "주식 서버에 연결에 문제가 있어, 검색기준으로 알려드려요.").strip()
+ # 주식 버튼 대답 방식: 숫자를 정확히 말한 뒤 간단한 전체 브리핑까지 덧붙인다 (자료 있을 때/없을 때 모두 같은 규칙)
+ #   브리핑 근거는 자료의 등락과 검색으로 확인되는 내용뿐이다. 대답이 길어지므로 PIPE_MAX_TOKENS(기본 1024)가 너무 작으면 올려야 한다
+ _QUICK_STOCK_BRIEF_RULE = ("먼저 코스피·코스닥 지수(포인트)와 비트코인 가격, 전일 대비 등락은 숫자를 정확히 말하고, 거기서 끝내지 말고 간단한 전체 브리핑을 이어서 덧붙여 줘. "
+                            "브리핑에는 ① 코스피와 코스닥 흐름을 견준 오늘 시장 분위기, ② 비트코인 동향까지 함께 본 투자 심리, "
+                            "③ 검색으로 확인되는 오늘 시장을 움직인 요인(환율, 외국인·기관 수급, 미국 증시, 주요 이슈 등) 한두 가지를 담을 것. "
+                            "브리핑의 근거는 자료의 등락과 검색으로 확인한 내용뿐이고, 확인이 안 되는 요인이나 숫자는 지어내지 말고 빼 줘. "
+-                           "음성 대답은 40초 안팎(예닐곱 문장)으로, 숫자 -> 전체 브리핑 -> 한마디 마무리 순서로 말하고, 서버나 오류 얘기, 매수·매도 권유는 하지 말 것.")
++                           "음성 대답은 40초 안팎(예닐곱 문장)으로, 숫자 -> 전체 브리핑 -> 한마디 마무리 순서로 말하고, 서버·연결 상태 얘기(필요한 안내는 이미 끝났다)와 매수·매도 권유는 하지 말 것.")
+ # 주식봇 조회가 전부 실패했을 때 모델에게 주는 안내 (오류 얘기 없이 검색으로 찾아 말하게 한다)
+ _QUICK_STOCK_SEARCH_HINT = ("[시세 자료 없음 - 상대가 '주식' 버튼을 눌러 코스피·코스닥 지수와 비트코인 가격을 물었다. 미리 받아 둔 시세 자료는 없다.] "
+                             "검색으로 지금 코스피·코스닥 지수(포인트, 전일 대비 등락)와 비트코인 가격(원화, 등락률)을 찾아서 알려줘. "
+-                            "서버, 오류, 조회 실패, 주식봇 같은 말은 절대 하지 말고 평소처럼 자연스럽게 시황만 말할 것. "
++                            "연결 문제 안내는 이미 끝났으니 서버, 오류, 조회 실패, 주식봇 같은 말은 다시 꺼내지 말고, 바로 검색 기준으로 시황을 자연스럽게 말할 것. "
+                             "검색 결과에 없는 숫자는 지어내지 말고, 못 찾은 항목은 언급하지 말고 넘어갈 것. "
+                             + _QUICK_STOCK_BRIEF_RULE)
+ 
+@@ -6719,9 +6722,11 @@
+ def _pipe_stock_collect(futs, deadline_s: float):
+     """[(질문, 주식봇 Future, 자체 조회 Future 또는 None)]의 결과를 모아 (모델에게 줄 자료 글, 실패 안내 이름)을 돌려준다.
+     항목마다 주식봇 답을 먼저 쓰고, 주식봇이 실패한 항목은 자체 조회 결과로 채운다. 하나라도 있으면 자료 글만 돌려준다.
+-    전부 실패하면 자료 글은 비고, 안내 이름은 stock_down > stock_error 순서(둘 다 아니면 \"\")."""
++    전부 실패하면 자료 글은 비고, 안내 이름은 stock_down > stock_error 순서(둘 다 아니면 \"\").
++    세 번째 값은 '주식봇(오라클) 연결이 실패한 항목이 있었는가'(응답 없음/오류). 주식봇이 없거나 못 찾음은 해당하지 않는다."""
+     t_end = time.monotonic() + max(1.0, deadline_s)
+     ok, miss, fails = [], [], []
++    bot_failed = False
+     for q, f, fs in futs:
+         try:
+             d, fail = f.result(timeout=max(0.1, t_end - time.monotonic()))
+@@ -6733,6 +6738,8 @@
+             ok.append((str(d.get("name") or q), text.strip()[:_QUICK_STOCK_TEXT_MAX]))
+             logging.info("[주식봇] 버튼 조회 %r -> %d자", q, len(text))
+             continue
++        if fail in ("stock_down", "stock_error"):
++            bot_failed = True
+         sd = None
+         if fs is not None:      # 주식봇이 못 줬으면 자체 조회로 대신한다
+             try:
+@@ -6747,7 +6754,7 @@
+         fails.append(fail or "stock_none")
+         logging.info("[주식봇] 버튼 조회 %r 실패: %s", q, fail or (d or {}).get("message") or "stock_none")
+     if not ok:
+-        return "", ("stock_down" if "stock_down" in fails else ("stock_error" if "stock_error" in fails else ""))
++        return "", ("stock_down" if "stock_down" in fails else ("stock_error" if "stock_error" in fails else "")), bot_failed
+     parts = ["[방금 조회한 최신 시세 자료 - 상대가 '주식' 버튼을 눌러 국내 지수와 비트코인 가격을 물었다]"]
+     for name, text in ok:
+         parts.append("### " + name + "\n" + text)
+@@ -6756,7 +6763,7 @@
+     parts.append("지수(포인트)와 가격, 전일 대비 등락, 등락률 숫자는 위 자료에 적힌 것만 그대로 정확히 말할 것(없는 숫자는 지어내지 말 것). "
+                  + _QUICK_STOCK_BRIEF_RULE + " 자료가 없는 항목이 있으면 검색으로 확인해서 말하고, 확인이 안 되면 그 항목은 언급하지 말고 넘어갈 것. "
+                  "자료를 어디서 어떻게 가져왔는지는 말하지 말 것. get_market_analysis 같은 함수는 다시 부르지 말 것.")
+-    return "\n\n".join(parts), ""
++    return "\n\n".join(parts), "", bot_failed
+ 
+ 
+ # ----- 화면의 '타로' 버튼: 오늘의 타로 카드 한 장 (카드는 서버가 뽑고, 모델은 그 카드의 풀이만 한다) -----
+@@ -7924,8 +7931,11 @@
+                 if _qs_pending and PIPE_FILLERS and not filler_sent:
+                     filler_sent = True
+                     yield _pipe_ev({"type": "delta", "filler": True, "text": random.choice(PIPE_FILLERS) + " "})
+-                _qs_block, _qs_canned = _pipe_stock_collect(quick_stock_futs, STOCKBOT_CONNECT_TIMEOUT + STOCKBOT_TIMEOUT + 3)
++                _qs_block, _qs_canned, _qs_botfail = _pipe_stock_collect(quick_stock_futs, STOCKBOT_CONNECT_TIMEOUT + STOCKBOT_TIMEOUT + 3)
+                 if _qs_block:
++                    if _qs_botfail and _QUICK_STOCK_NOTICE:     # 오라클 연결 실패: 안내 한 문장을 먼저 말하고, 이어서 자체 조회 자료로 답한다
++                        filler_sent = True
++                        yield _pipe_ev({"type": "delta", "filler": True, "text": _QUICK_STOCK_NOTICE + " "})
+                     contents = _pipe_build_contents(data.get("turns"), list(user_parts) + [T.Part(text=_qs_block)])
+                 elif PIPE_QUICK_STOCK_ERR_SAY and _qs_canned and not STOCKBOT_FALLBACK and CANNED_TEXTS.get(_qs_canned):
+                     # (PIPE_QUICK_STOCK_ERR_SAY=1일 때만) 주식봇도 자체 조회도 실패: 모델을 부르지 않고 미리 저장한 안내를 읽는다 (대화 기록에는 남기지 않는다)
+@@ -7935,8 +7945,11 @@
+                                     "filler": True, "apology": True, "canned": _qs_canned})
+                     return
+                 else:
+-                    # 주식봇도 자체 조회도 자료를 못 줬다: 오류 안내는 읽지 않고, 모델이 검색으로 찾아 자연스럽게 시황을 말한다
+-                    logging.info("[pipe] 주식 버튼: 시세 자료 없음(%s) - 오류 안내 없이 모델이 검색으로 답합니다", _qs_canned or "못 찾음")
++                    # 주식봇도 자체 조회도 자료를 못 줬다: 연결 실패였으면 안내 한 문장을 먼저 말하고, 모델이 검색으로 찾아 시황을 말한다
++                    logging.info("[pipe] 주식 버튼: 시세 자료 없음(%s) - 모델이 검색으로 답합니다 (안내=%s)", _qs_canned or "못 찾음", bool(_qs_botfail and _QUICK_STOCK_NOTICE))
++                    if _qs_botfail and _QUICK_STOCK_NOTICE:
++                        filler_sent = True
++                        yield _pipe_ev({"type": "delta", "filler": True, "text": _QUICK_STOCK_NOTICE + " "})
+                     contents = _pipe_build_contents(data.get("turns"), list(user_parts) + [T.Part(text=_QUICK_STOCK_SEARCH_HINT)])
+             if quick_tarot:
+                 # 카드 그림은 화면에 보내지 않는다 - 모델이 이 카드의 이름·방향과 풀이를 목소리로만 말한다
