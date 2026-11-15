@@ -1,0 +1,620 @@
+--- /mnt/user-data/uploads/token_server_new__1_.py	2026-11-14 11:12:47.957098000 +0000
++++ /home/claude/token_server_new.py	2026-11-15 00:23:51.291769032 +0000
+@@ -1030,6 +1030,54 @@
+ DATABASE_URL = os.environ.get("DATABASE_URL")
+ EXTRA_INFO_MAX_ITEMS = 30      # 텔레그램 봇의 get_extra_info_context(max_items=30)와 동일
+ _SETTINGS_TTL_SEC = 60         # 토큰 발급마다 DB에 붙지 않도록 짧게 캐시
++
++# ===== 캐시가 만료돼도 대답을 기다리게 하지 않는다 (stale-while-revalidate) =====
++# 개인화 기억/반복 표현/기억 인출 목록은 DB에서 새 연결을 열고 쿼리를 여러 번 던져 읽는다(원격 DB면 3초 안팎).
++# 예전에는 캐시(30~300초)가 만료된 뒤 첫 말마다 이 읽기가 끝날 때까지 대답이 기다렸다.
++# 이제는 한 번이라도 읽어 둔 값이 있으면 그 값을 바로 쓰고, 새로 읽는 건 뒤에서 한다 (다음 말부터 새 값).
++# 새 기억을 저장해서 캐시를 비운 경우(at=0)와 아직 한 번도 못 읽은 경우에는 예전처럼 새로 읽을 때까지 기다린다.
++#   CACHE_SWR=0 : 끔(예전 동작) / CACHE_MAX_STALE_SEC : 이보다 오래된 값은 바로 쓰지 않고 새로 읽는다 (기본 900초 = 15분)
++CACHE_SWR = os.environ.get("CACHE_SWR", "1").strip() != "0"
++try:
++    CACHE_MAX_STALE_SEC = float(os.environ.get("CACHE_MAX_STALE_SEC", "900") or 900)
++except ValueError:
++    CACHE_MAX_STALE_SEC = 900.0
++_SWR_LOCK = threading.Lock()
++_SWR_RUNNING = set()
++
++
++def _swr_spawn(key, job):
++    """같은 key의 갱신이 이미 돌고 있으면 건너뛰고, 아니면 뒤에서 job()을 한 번 돌린다."""
++    with _SWR_LOCK:
++        if key in _SWR_RUNNING:
++            return
++        _SWR_RUNNING.add(key)
++
++    def _run():
++        try:
++            job()
++        except Exception as e:
++            logging.warning("[캐시 갱신] %s 실패: %s", key, e)
++        finally:
++            with _SWR_LOCK:
++                _SWR_RUNNING.discard(key)
++    threading.Thread(target=_run, daemon=True).start()
++
++
++def _prewarm_caches():
++    """캐시를 비운 직후(새 기억 저장 등) 뒤에서 미리 다시 읽어 둬서, 다음 말이 읽기를 기다리지 않게 한다."""
++    if not CACHE_SWR:
++        return
++
++    def _job():
++        if not (DATABASE_URL and psycopg2 is not None and OWNER_USER_ID is not None):
++            return
++        get_owner_full_context(False)
++        get_owner_full_context(True)
++        if RECALL_ENABLED:
++            _load_moments_for_recall()
++    _swr_spawn(("prewarm",), _job)
++
+ _settings_cache = {"at": 0.0, "data": None}
+ 
+ # ===== owner(관리자) 개인화 컨텍스트 =====
+@@ -1127,6 +1175,15 @@
+     cached = _settings_cache["data"]
+     if cached is not None and now - _settings_cache["at"] < _SETTINGS_TTL_SEC:
+         return cached
++    if CACHE_SWR and cached is not None and _settings_cache["at"] > 0 and now - _settings_cache["at"] < CACHE_MAX_STALE_SEC:
++        def _job():
++            try:
++                _settings_cache.update(at=time.monotonic(), data=_load_character_settings())
++            except Exception as e:
++                logging.warning("캐릭터 설정 DB 조회 실패 - %s", e)
++                _settings_cache["at"] = time.monotonic() - _SETTINGS_TTL_SEC + 10
++        _swr_spawn(("settings",), _job)
++        return cached
+     try:
+         data = _load_character_settings()
+         _settings_cache.update(at=now, data=data)
+@@ -1741,6 +1798,15 @@
+     cache = _owner_ctx_cache_rm if recall_mode else _owner_ctx_cache
+     if now - cache["at"] < _OWNER_CTX_TTL_SEC:
+         return cache["data"]
++    if CACHE_SWR and cache["at"] > 0 and now - cache["at"] < CACHE_MAX_STALE_SEC:
++        def _job(_c=cache, _rm=recall_mode):
++            try:
++                _c.update(at=time.monotonic(), data=_build_owner_context_text(OWNER_USER_ID, _rm))
++            except Exception as e:
++                logging.warning("owner 개인화 컨텍스트 DB 조회 실패 - %s", e)
++                _c["at"] = time.monotonic() - _OWNER_CTX_TTL_SEC + 10      # 10초 뒤 다시 시도
++        _swr_spawn(("owner", recall_mode), _job)
++        return cache["data"]      # 만료됐지만 한 번 읽어 둔 값이 있으면 그걸 바로 쓴다
+     try:
+         text = _build_owner_context_text(OWNER_USER_ID, recall_mode)
+         cache.update(at=now, data=text)
+@@ -2342,6 +2408,7 @@
+             _owner_ctx_cache["at"] = 0.0  # 다음 토큰 발급 때 새 요약/기억이 바로 반영되게
+             _owner_ctx_cache_rm["at"] = 0.0
+             _moment_cache["at"] = 0.0
++            _prewarm_caches()
+             logging.info("날짜 전환 정리 완료: %s (%d건, 에피소드 %d개 저장)", day, len(day_rows), saved_eps)
+     except Exception as e:
+         _rollover_last_fail_at = time.monotonic()
+@@ -2473,6 +2540,7 @@
+         _owner_ctx_cache["at"] = 0.0  # 30초 캐시를 비워서, 바로 새 세션을 열면 이 기억이 반영되게 한다
+         _owner_ctx_cache_rm["at"] = 0.0
+         _moment_cache["at"] = 0.0
++        _prewarm_caches()
+         logging.info("명시적 기억 요청 저장 (user_id=%s): [%s] %s", user_id, topic, detail)
+     except Exception as e:
+         logging.warning("명시적 기억 요청 처리 실패 - %s", e)
+@@ -2631,8 +2699,16 @@
+ def _load_moments_for_recall():
+     now = time.monotonic()
+     with _moment_cache_lock:
+-        if now - _moment_cache["at"] < _MOMENT_CACHE_TTL:
+-            return _moment_cache["rows"]
++        _age, _at, _rows = now - _moment_cache["at"], _moment_cache["at"], _moment_cache["rows"]
++    if _age < _MOMENT_CACHE_TTL:
++        return _rows
++    if CACHE_SWR and _at > 0 and _rows and _age < CACHE_MAX_STALE_SEC:
++        _swr_spawn(("moments",), _fetch_moments)      # 만료됐지만 읽어 둔 목록이 있으면 그걸로 바로 인출하고, 새로 읽는 건 뒤에서
++        return _rows
++    return _fetch_moments()
++
++
++def _fetch_moments():
+     conn = _history_db_connect()
+     try:
+         cur = conn.cursor()
+@@ -3161,13 +3237,17 @@
+     return out
+ 
+ 
+-def build_repetition_avoid_context() -> str:
++def build_repetition_avoid_context(_force: bool = False) -> str:
+     """토큰 발급 때 프롬프트에 넣을 '최근 반복 표현' 블록. DB가 없거나 실패하거나 반복이 없으면 빈 문자열."""
+     if not DATABASE_URL or psycopg2 is None or OWNER_USER_ID is None:
+         return ""
+     now = time.time()
+-    if now - _repeat_cache["at"] < _REPEAT_TTL_SEC:
+-        return _repeat_cache["data"]
++    if not _force:
++        if now - _repeat_cache["at"] < _REPEAT_TTL_SEC:
++            return _repeat_cache["data"]
++        if CACHE_SWR and _repeat_cache["at"] > 0 and now - _repeat_cache["at"] < CACHE_MAX_STALE_SEC:
++            _swr_spawn(("repeat",), lambda: build_repetition_avoid_context(_force=True))
++            return _repeat_cache["data"]
+     try:
+         conn = _history_db_connect()
+         try:
+@@ -3208,8 +3288,12 @@
+ - 여전히 금지: 이모티콘/이모지, 대괄호·꺾쇠 태그, '(웃음)'·'*웃으며*' 같은 지문, 목록·번호"""
+ 
+ 
++_SYSPROMPT_PREFIX_INFO = {"len": 0, "hash": ""}      # 마지막으로 조립한 시스템 프롬프트의 '고정 앞부분' 길이/해시 (캐시가 걸리는지 로그로 확인하는 용도)
++
++
+ def build_system_prompt(stt_mode: bool = False, voice_history: str = "", location_label: str = "",
+-                        eleven_voice: bool = False, recall_block=None) -> str:
++                        eleven_voice: bool = False, recall_block=None,
++                        cache_order: bool = False, static_tail: str = "", tail_reminder: str = "") -> str:
+     """페르소나 → (DB) 커스텀 프롬프트 → (DB) 추가 정보 → (DB) owner 개인화 컨텍스트 →
+     음성 지침 → 현재 시각 순으로 조립한다.
+     (텔레그램 봇의 get_active_taeyeon_prompt / get_extra_info_context / get_taeyeon_response의
+@@ -3219,27 +3303,28 @@
+     else:
+         custom, extra = get_character_settings()
+     owner_ctx = get_owner_full_context(recall_mode=(recall_block is not None))   # recall_block이 있으면 기억은 최신 몇 건만 상시 주입
+-    parts = [PERSONA_PROMPT]
++    _add = lambda cat, txt: parts.append((cat, txt))
++    parts = [("s", PERSONA_PROMPT)]      # (구분, 글) - s: 거의 안 바뀜 / m: 가끔 바뀜(기억) / v: 매번 바뀜
+     if INDEPENDENT_PERSONA and PERSONA_USER_INFO:
+-        parts.append(
++        _add("s", 
+             "[지금 대화하는 상대에 대해 이미 알고 있는 정보 - 오랫동안 알고 지낸 사이처럼 자연스럽게 참고만 할 것]\n"
+             + PERSONA_USER_INFO
+             + "\n- 위 정보를 나열하듯 읊거나 '제가 알기로는' 식으로 티 내지 말 것. 대화 흐름에 필요할 때만 한두 가지 살짝 반영할 것\n"
+             "- 상대가 먼저 꺼내지 않은 슬픈 일(배우자를 잃은 일, 건강 문제 등)을 먼저 들추지 말 것"
+         )
+     if custom:
+-        parts.append(
++        _add("s", 
+             "[아래는 나중에 추가로 업데이트된 최신 정보/설정입니다. 위의 기본 성격과 절대 규칙(호칭 등)은 항상 유지한 채, "
+             "아래 내용을 참고해서 최신 상태를 반영하세요. 위 내용과 겹치거나 달라진 부분이 있으면 아래 최신 내용을 우선하세요.]\n"
+             + custom
+         )
+     if extra:
+-        parts.append(
++        _add("s", 
+             "[태연 관련 최신 추가 정보 - 사실로 취급하고 자연스럽게 대화에 반영할 것]\n"
+             + "\n".join(f"- {t}" for t in extra)
+         )
+     if owner_ctx:
+-        parts.append(
++        _add("m", 
+             ("[아래는 지금까지 상대와 나눈 대화에서 쌓인 기억입니다. "
+              if INDEPENDENT_PERSONA else
+              "[아래는 태연봇(텔레그램) DB에 쌓여있는 상대(owner)에 대한 개인화 정보입니다. ")
+@@ -3247,23 +3332,23 @@
+             + owner_ctx
+         )
+     if recall_block:
+-        parts.append(recall_block)
++        _add("v", recall_block)
+     if SONGS_ENABLED:
+-        parts.append(song_player.PROMPT_NOTE)
++        _add("s", song_player.PROMPT_NOTE)
+     if voice_history:
+-        parts.append(voice_history)
++        _add("v", voice_history)
+     repeat_block = build_repetition_avoid_context()
+     if repeat_block:
+-        parts.append(repeat_block)
+-    parts.append(_voice_prompt_now())
++        _add("v", repeat_block)
++    _add("s", _voice_prompt_now())
+     if eleven_voice:
+-        parts.append(ELEVEN_STYLE_NOTE)
++        _add("s", ELEVEN_STYLE_NOTE)
+     # 타입캐스트로 읽는 접속(Live ?eleven=1 또는 /pipe 모델 태그 모드)에서만 생략/요약 금지 지침 추가
+     if TTS_TYPECAST and (eleven_voice or PIPE_MODEL_TAGS) and _tts_ext_ready() \
+             and os.environ.get("TYPECAST_FULL_READ", "1").strip() != "0":
+-        parts.append(TC_FULL_READ_NOTE)
++        _add("s", TC_FULL_READ_NOTE)
+     if stt_mode:
+-        parts.append(STT_NOTE)
++        _add("s", STT_NOTE)
+ 
+     now = datetime.datetime.now(tz=KST)
+     time_block = (
+@@ -3297,7 +3382,15 @@
+             "- 위 위치 정보와 모순되는 걸 되묻지 말 것 (예: 이미 '집'으로 확인됐는데 \"퇴근했어?\", "
+             "\"아직 회사야?\" 같은 질문 던지지 말 것)"
+         )
+-    return "\n\n".join(parts) + time_block + location_block
++    if not cache_order:
++        return "\n\n".join(t for _c, t in parts) + time_block + location_block
++    # 캐시 친화 순서: 안 바뀌는 글 -> 가끔 바뀌는 글(기억) -> 매번 바뀌는 글(인출한 기억, 대화 기록, 시각, 위치) 순서로 둔다.
++    # 모델 쪽 자동 캐시는 요청의 '앞부분이 글자 하나까지 같을 때만' 걸리기 때문에, 바뀌는 글이 앞에 끼면 그 뒤는 전부 캐시되지 않는다.
++    static_texts = [t for c, t in parts if c == "s"] + ([static_tail.strip()] if static_tail and static_tail.strip() else [])
++    static_part = "\n\n".join(static_texts)
++    _SYSPROMPT_PREFIX_INFO.update(len=len(static_part), hash=hashlib.sha256(static_part.encode("utf-8")).hexdigest()[:8])
++    rest = [t for c, t in parts if c == "m"] + [t for c, t in parts if c == "v"]
++    return "\n\n".join([static_part] + rest) + time_block + location_block + (("\n\n" + tail_reminder.strip()) if tail_reminder and tail_reminder.strip() else "")
+ 
+ 
+ # 실제로 웹앱을 서빙할 도메인으로 좁혀두는 걸 권장 (일단 전체 허용)
+@@ -4109,9 +4202,12 @@
+     return user_req or erotic
+ 
+ 
++_canned_ctx = threading.local()      # 안내 음성을 미리 합성하는 동안만 켠다 (속삭임 이어받기/감정 연출가를 건너뜀)
++
++
+ def _tc_apply_sticky(preset: str, tag: str, text: str = ""):
+     """문장 하나의 (프리셋, 태그)를 속삭임 규칙에 맞게 고친다. -> (프리셋, 태그, 이어받았는지)"""
+-    if not TYPECAST_STICKY:
++    if not TYPECAST_STICKY or getattr(_canned_ctx, "on", False):
+         return preset, tag, False
+     user_req, erotic, can_auto = _tc_whisper_state(text)
+     if tag in _TC_STICKY_TAGS:                      # 본 모델이 이 문장에 [whispers]를 썼다
+@@ -6444,6 +6540,48 @@
+ 
+ _install_stockbot_proxy()
+ 
++# ----- 화면의 '주식' 버튼: 모델에게 맡기지 않고 서버가 주식봇(오라클)에 직접 물어, 지수와 가격 자료를 대답 모델에게 건네준다 -----
++#   PIPE_QUICK_STOCK=0           : 끔 (기본 켜짐). 끄거나 STOCKBOT_URL/KEY가 없으면 버튼 문장을 평소 대화처럼 모델이 처리한다
++#   PIPE_QUICK_STOCK_QUERIES     : 주식봇에 물어볼 항목을 쉼표로 (기본 "코스피,코스닥,비트코인"). 항목마다 따로, 동시에 묻는다 (최대 4개)
++#   주식봇이 응답이 없거나 오류면 미리 저장한 안내(stock_down/stock_error)를 읽는다. 전부 "못 찾음"이면(또는 STOCKBOT_FALLBACK=1이면)
++#   모델이 평소처럼 검색해서 답한다.
++PIPE_QUICK_STOCK = os.environ.get("PIPE_QUICK_STOCK", "1").strip() != "0"
++PIPE_QUICK_STOCK_QUERIES = [q.strip() for q in os.environ.get("PIPE_QUICK_STOCK_QUERIES", "코스피,코스닥,비트코인").split(",") if q.strip()][:4] \
++    or ["코스피", "코스닥", "비트코인"]
++_QUICK_STOCK_TEXT_MAX = 1800      # 항목 하나당 모델에게 넘기는 최대 글자 수 (토큰 절약)
++
++
++def _pipe_stock_collect(futs, deadline_s: float):
++    """[(질문, Future)]의 주식봇 조회 결과를 모아 (모델에게 줄 자료 글, 실패 안내 이름)을 돌려준다.
++    하나라도 성공하면 자료 글만 돌려준다. 전부 실패하면 자료 글은 비고, 안내 이름은 stock_down > stock_error 순서(둘 다 아니면 "")."""
++    t_end = time.monotonic() + max(1.0, deadline_s)
++    ok, miss, fails = [], [], []
++    for q, f in futs:
++        try:
++            d, fail = f.result(timeout=max(0.1, t_end - time.monotonic()))
++        except Exception as e:      # 시간 초과 등
++            logging.warning("[주식봇] %r 조회 대기 실패: %s", q, type(e).__name__)
++            d, fail = None, "stock_down"
++        text = d.get("text") if isinstance(d, dict) else None
++        if isinstance(d, dict) and d.get("found") and isinstance(text, str) and text.strip():
++            ok.append((str(d.get("name") or q), text.strip()[:_QUICK_STOCK_TEXT_MAX]))
++            logging.info("[주식봇] 버튼 조회 %r -> %d자", q, len(text))
++        else:
++            miss.append(q)
++            fails.append(fail or "stock_none")
++            logging.info("[주식봇] 버튼 조회 %r 실패: %s", q, fail or (d or {}).get("message") or "stock_none")
++    if not ok:
++        return "", ("stock_down" if "stock_down" in fails else ("stock_error" if "stock_error" in fails else ""))
++    parts = ["[주식봇이 방금 조회한 최신 자료 - 상대가 '주식' 버튼을 눌러 국내 지수와 비트코인 가격을 물었다]"]
++    for name, text in ok:
++        parts.append("### " + name + "\n" + text)
++    if miss:
++        parts.append("(조회하지 못한 항목: " + ", ".join(miss) + ")")
++    parts.append("이 자료만 근거로 코스피·코스닥 지수와 비트코인 가격 위주로 말해줘. 자료에 적힌 지수(포인트), 전일 대비 등락, 가격(원화/달러)과 등락률만 숫자로 "
++                 "말하고 없는 숫자나 뉴스는 지어내지 말 것. 음성 대답은 20초 안팎(서너 문장)으로 핵심만, 조회하지 못한 항목이 있으면 "
++                 "그건 못 가져왔다고 한마디만 할 것. 함수는 다시 부르지 말고, 매수·매도 권유는 하지 말 것.")
++    return "\n\n".join(parts), ""
++
+ 
+ # ===== 파이프라인 모드 (/pipe) : Gemini Live 없이 '입력(글자/음성) → generateContent → 문장 단위 TTS' =====
+ # 기존 Live 방식(/, /api/token)은 그대로 두고, 별도 페이지(/pipe = taeyeon-pipe.html)에서만 쓴다.
+@@ -6560,6 +6698,12 @@
+ #     bad_input    PIPE_BADINPUT_SAY     보낸 음성이 비었거나 깨졌을 때
+ #     busy         PIPE_BUSY_FILLER      구글 모델이 과부하일 때 (위 사과 한마디와 같은 문장)
+ #     error        PIPE_ERROR_FILLER     그 밖의 서버 오류로 대답을 못 만들었을 때
++#     filler1,2..  PIPE_FILLER           대답이 느릴 때 먼저 하는 한마디 ('잠시만요.', 쉼표로 여러 개면 번호별로 하나씩)
++#     cont         PIPE_CONT_FILLER      대답이 중간에 끊겨 이어받기 전에 하는 한마디 ('잠시만, 또 끊기네..')
++#     cont_fail    PIPE_CONT_FAIL_FILLER 이어받기까지 실패했을 때 마지막 한마디
++#     timeout      PIPE_TIMEOUT_SAY      모델이 제한 시간 안에 응답하지 않아 멈췄을 때
++#     blocked      PIPE_BLOCKED_SAY      모델 안전 필터로 대답이 막혔을 때
++#     bad_image    PIPE_BADIMAGE_SAY     보낸 사진이 지원하지 않는 형식이거나 너무 크거나 깨졌을 때
+ #   PIPE_STOP_WORDS : 이 말만 했을 때 '그만'으로 본다 (쉼표로 구분, 띄어쓰기/문장부호는 무시, off면 끔). 기본 그만,그만해,그만해요,그만해줘,...
+ #   PIPE_STOP_AUDIO_MAX_KB : 음성 파일로 보낸 말은 받아쓰기를 먼저 해야 '그만'인지 알 수 있다. 이 크기(KB) 이하의 짧은 음성에만 먼저 받아쓰기한다 (기본 48, 0이면 음성은 확인 안 함)
+ CANNED_TEXTS = {k: v for k, v in {
+@@ -6570,9 +6714,22 @@
+     "bad_input": _pipe_env_say("PIPE_BADINPUT_SAY", "어, 잘 못 들었어요. 다시 한 번 말해줄래요?"),
+     "busy": PIPE_BUSY_FILLER,
+     "error": PIPE_ERROR_FILLER,
++    "timeout": _pipe_env_say("PIPE_TIMEOUT_SAY", "대답이 너무 오래 걸려서 멈췄어요. 미안해요. 다시 한 번만 말해줄래요?"),
++    "blocked": _pipe_env_say("PIPE_BLOCKED_SAY", "음, 그 이야기는 내가 대답하기 어려워요. 다른 이야기를 해볼까요?"),
++    "bad_image": _pipe_env_say("PIPE_BADIMAGE_SAY", "사진을 제대로 못 읽었어요. 다시 한 번 보내줄래요?"),
++    "cont": PIPE_CONT_FILLER.strip(),
++    "cont_fail": PIPE_CONT_FAIL_FILLER.strip(),
+ }.items() if v}
++# 대답이 느릴 때 먼저 하는 한마디('잠시만요.')도 같은 방식으로 파일(voice_notes/filler1.wav ...)에 저장해 두고 재생한다 (6시간 만료 없음)
++for _i, _f in enumerate(PIPE_FILLERS, 1):
++    CANNED_TEXTS.setdefault("filler%d" % _i, _f)
+ CANNED_VOICE_DIR = os.environ.get("CANNED_VOICE_DIR", "").strip() or os.path.join(os.path.dirname(os.path.abspath(__file__)), "voice_notes")
+-_CANNED_BY_TEXT = {v.strip(): k for k, v in CANNED_TEXTS.items()}
++def _canned_norm(t) -> str:
++    """안내 문장을 비교할 때 쓰는 모양: 공백을 하나로, 끝의 마침표/말줄임표/공백은 뺀다 ('끊기네..'와 '끊기네.'를 같은 문장으로 본다)."""
++    return re.sub(r"[\s.…]+$", "", re.sub(r"\s+", " ", t or "").strip())
++
++
++_CANNED_BY_TEXT = {_canned_norm(v): k for k, v in CANNED_TEXTS.items()}
+ _CANNED_PCM = {}            # 이름 -> 24kHz 16bit mono PCM (만료 없음)
+ _stop_raw = os.environ.get("PIPE_STOP_WORDS", "그만,그만해,그만해요,그만해줘,그만해줘요,그만하자,그만할래,그만할게,그만좀해,그만좀해줘,멈춰,멈춰줘,스톱").strip()
+ _STOP_NORM_RE = re.compile(r"[\s.,!?~…·'\"“”‘’()\-]+")
+@@ -6589,7 +6746,7 @@
+     """/api/tts로 온 문장이 미리 저장해 둔 안내 문장과 똑같으면 그 음성(PCM)을, 아니면 None."""
+     if not isinstance(text, str):
+         return None
+-    key = _CANNED_BY_TEXT.get(text.strip())
++    key = _CANNED_BY_TEXT.get(_canned_norm(text))
+     return _CANNED_PCM.get(key) if key else None
+ 
+ 
+@@ -6599,6 +6756,12 @@
+         if not os.path.isfile(path):
+             continue
+         try:
++            txt_path = os.path.join(CANNED_VOICE_DIR, key + ".txt")
++            if os.path.isfile(txt_path):
++                with open(txt_path, "r", encoding="utf-8") as tf:
++                    if tf.read().strip() != CANNED_TEXTS[key].strip():
++                        logging.info("안내 문장이 바뀌어 저장된 음성은 쓰지 않고 다시 만듭니다: %s", key)
++                        continue
+             with open(path, "rb") as f:
+                 pcm = _wav_to_pcm24k(f.read())
+             if pcm:
+@@ -6608,6 +6771,23 @@
+             logging.warning("음성 안내 파일을 읽지 못했어요(%s): %s", path, e)
+ 
+ 
++def _canned_save_file(key: str, pcm: bytes):
++    """합성한 안내 음성을 voice_notes/<이름>.wav(+문장 .txt)로 저장한다. 다음에 서버가 떠도 API를 부르지 않고 이 파일을 쓴다."""
++    try:
++        import wave
++        os.makedirs(CANNED_VOICE_DIR, exist_ok=True)
++        with wave.open(os.path.join(CANNED_VOICE_DIR, key + ".wav"), "wb") as w:
++            w.setnchannels(1)
++            w.setsampwidth(2)
++            w.setframerate(24000)
++            w.writeframes(pcm)
++        with open(os.path.join(CANNED_VOICE_DIR, key + ".txt"), "w", encoding="utf-8") as tf:
++            tf.write(CANNED_TEXTS[key])
++        logging.info("음성 안내 파일 저장: %s/%s.wav", CANNED_VOICE_DIR, key)
++    except Exception as e:
++        logging.warning("음성 안내 파일을 저장하지 못했어요(%s): %s", key, e)
++
++
+ def _canned_warm():
+     """파일이 없는 안내는 서버가 뜬 뒤 TTS로 한 번 합성해 둔다. 실패하면 간격을 늘려가며 몇 차례 다시 시도한다."""
+     time.sleep(12)
+@@ -6617,10 +6797,16 @@
+             return
+         for k in todo:
+             try:
+-                with app.test_request_context("/api/tts", method="POST", json={"text": CANNED_TEXTS[k]}):
+-                    resp = app.make_response(_eleven_tts_impl())
++                _canned_ctx.on = True      # 감정 연출가(Gemini)와 속삭임 이어받기 없이, 차분한 기본 목소리로 한 번만 만든다
++                try:
++                    with app.test_request_context("/api/tts", method="POST", json={"text": CANNED_TEXTS[k], "tags": False}):
++                        resp = app.make_response(_eleven_tts_impl())
++                finally:
++                    _canned_ctx.on = False
++                if True:
+                     if resp.status_code == 200 and resp.get_data():
+                         _CANNED_PCM[k] = resp.get_data()
++                        _canned_save_file(k, _CANNED_PCM[k])
+                         logging.info("음성 안내 미리 합성 완료: %s %r (%.1f초)", k, CANNED_TEXTS[k], len(_CANNED_PCM[k]) / 2 / 24000)
+                     else:
+                         logging.warning("음성 안내 미리 합성 실패: %s (HTTP %s)", k, resp.status_code)
+@@ -6635,17 +6821,23 @@
+     threading.Thread(target=_canned_warm, daemon=True).start()
+ 
+ 
+-def _pipe_apology_text(err) -> str:
++def _pipe_apology_text(err, finish_name="") -> str:
+     """대답을 못 만든 원인에 맞는 사과 한마디. 끄면 빈 문자열."""
+     m = str(err or "")
+     busy = any(k in m for k in ("503", "UNAVAILABLE", "429", "RESOURCE_EXHAUSTED", "overloaded", "high demand", "DEADLINE_EXCEEDED"))
+-    return PIPE_BUSY_FILLER if busy else PIPE_ERROR_FILLER
++    if busy:
++        return PIPE_BUSY_FILLER
++    if isinstance(err, TimeoutError) and CANNED_TEXTS.get("timeout"):      # 첫 글자/글자 사이 제한 시간 초과
++        return CANNED_TEXTS["timeout"]
++    if not err and str(finish_name or "").upper() in ("SAFETY", "PROHIBITED_CONTENT", "BLOCKLIST", "SPII", "RECITATION") and CANNED_TEXTS.get("blocked"):
++        return CANNED_TEXTS["blocked"]      # 오류가 아니라 모델 필터가 막은 경우
++    return PIPE_ERROR_FILLER
+ PIPE_SEARCH_COOLDOWN = _env_float_tts("PIPE_SEARCH_COOLDOWN", 600.0)
+ _pipe_search_block_until = 0.0   # 검색 도구가 한도에 걸렸을 때, 이 시각(monotonic)까지는 검색 없이 호출한다
+ _PIPE_TEXT_MAX = 2000
+ _PIPE_AUDIO_MIMES = {"audio/wav", "audio/x-wav", "audio/mp3", "audio/mpeg", "audio/ogg", "audio/flac", "audio/aac"}
+ _PIPE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{6,50}$")
+-_pipe_executor = ThreadPoolExecutor(max_workers=4)  # 음성 입력의 받아쓰기를 대답 생성과 병렬로 돌리는 용도
++_pipe_executor = ThreadPoolExecutor(max_workers=8)  # 음성 입력의 받아쓰기를 대답 생성과 병렬로 돌리는 용도
+ 
+ PIPE_NOTE = """[이 대화의 입출력 방식 - 위 다른 안내와 겹치면 이 안내가 우선한다]
+ - 상대의 말은 글자 또는 음성 파일로 전달된다. 음성이면 한국어로 말한 것으로 알아듣고 답할 것. 정말 알아들을 수 없을 때만 "어, 잘 못 들었어요. 다시 한 번 말해줄래요?" 정도로 되물을 것
+@@ -6682,6 +6874,11 @@
+ if TTS_TYPECAST and TYPECAST_SOUNDS:
+     PIPE_STYLE_NOTE = PIPE_STYLE_NOTE + "\n\n" + TC_SOUND_NOTE
+ 
++# 시스템 프롬프트를 '안 바뀌는 글 먼저, 매번 바뀌는 글 나중' 순서로 조립해 모델의 자동 캐시(입력 토큰 할인)가 걸리게 한다. PIPE_CACHE_ORDER=0 이면 예전 순서
++PIPE_CACHE_ORDER = os.environ.get("PIPE_CACHE_ORDER", "1").strip() != "0"
++PIPE_TAIL_REMINDER = ("[마지막 확인] 앞에 나온 '[이 대화의 입출력 방식]' 안내(그리고 있다면 '[대답 글자 표현 안내]')는 "
++                      "다른 안내와 겹칠 때 항상 우선한다.")
++
+ PIPE_STT_PROMPT = ("위 음성은 한국어 대화 중 한 사람의 말이다. 들린 그대로 한국어 글자로 받아쓰기해라. "
+                    "받아쓴 글자만 출력하고 설명·따옴표·마크다운은 붙이지 마라. 말소리가 전혀 없거나 알아들을 수 없으면 아무것도 출력하지 마라.")
+ 
+@@ -7287,17 +7484,22 @@
+         if PIPE_MEDIA_REACT and IMAGE_ANALYSIS_ENABLED and isinstance(img_b64, str) and img_b64:
+             img_mime = str(data.get("image_mime") or "image/jpeg").lower().split(";")[0].strip()
+             if img_mime not in _IMAGE_ALLOWED_MIME:
+-                return jsonify({"error": "unsupported image type"}), 400
++                return _pipe_say_response(uuid.uuid4().hex[:16], "bad_image", warn="unsupported image type") if CANNED_TEXTS.get("bad_image") \
++                    else (jsonify({"error": "unsupported image type"}), 400)
+             if len(img_b64) > (IMAGE_MAX_BYTES * 4 // 3) + 64:
+-                return jsonify({"error": "image too large"}), 413
++                return _pipe_say_response(uuid.uuid4().hex[:16], "bad_image", warn="image too large") if CANNED_TEXTS.get("bad_image") \
++                    else (jsonify({"error": "image too large"}), 413)
+             try:
+                 img_bytes = base64.b64decode(img_b64, validate=True)
+             except Exception:
+-                return jsonify({"error": "bad image"}), 400
++                return _pipe_say_response(uuid.uuid4().hex[:16], "bad_image", warn="bad image") if CANNED_TEXTS.get("bad_image") \
++                    else (jsonify({"error": "bad image"}), 400)
+             if not img_bytes or len(img_bytes) > IMAGE_MAX_BYTES:
+-                return jsonify({"error": "image too large or empty"}), 413
++                return _pipe_say_response(uuid.uuid4().hex[:16], "bad_image", warn="image too large or empty") if CANNED_TEXTS.get("bad_image") \
++                    else (jsonify({"error": "image too large or empty"}), 413)
+         if not text_in and not audio_bytes and not img_bytes:
+-            return jsonify({"error": "missing input"}), 400
++            return _pipe_say_response(uuid.uuid4().hex[:16], "bad_input", warn="missing input") if CANNED_TEXTS.get("bad_input") \
++                else (jsonify({"error": "missing input"}), 400)
+ 
+         ctx = data.get("ctx") if isinstance(data.get("ctx"), str) else ""
+         if ctx and not hmac.compare_digest(_pipe_sign(ctx), str(data.get("sig") or "")):
+@@ -7309,7 +7511,21 @@
+             lat = lng = None
+         tid = data.get("tid") if isinstance(data.get("tid"), str) and _PIPE_ID_RE.match(data.get("tid")) else uuid.uuid4().hex[:16]
+ 
++        # 기억 인출(임베딩 호출)은 '그만' 확인 받아쓰기와 동시에 시작한다 (예전에는 받아쓰기가 끝난 뒤에야 시작해서 대기 시간이 더해졌다)
++        recall_fut, _t_recall0 = None, time.monotonic()
++        if RECALL_ENABLED and OWNER_USER_ID is not None and not (text_in and _pipe_is_stop(text_in)):
++            try:
++                _rq = _recall_query(text_in, data.get("turns"))
++                if _rq:
++                    recall_fut = _pipe_executor.submit(build_recall_block, _rq)
++            except Exception as e:
++                logging.warning("[recall] 시작 실패 - 예전 방식으로 진행: %s", type(e).__name__)
++        # 화면의 '주식' 버튼(quick=stock): 모델이 도구를 부르기를 기다리지 않고, 바로 주식봇에 항목별로 동시에 물어본다 (결과는 gen()에서 받는다)
++        quick_stock_futs = None
++        if PIPE_QUICK_STOCK and data.get("quick") == "stock" and STOCKBOT_URL and STOCKBOT_API_KEY and not audio_bytes and not img_bytes:
++            quick_stock_futs = [(q, _pipe_executor.submit(_stockbot_ask, q)) for q in PIPE_QUICK_STOCK_QUERIES]
+         # '그만' 같은 말은 대답 모델에 연결하지 않고, 미리 저장해 둔 "알았어." 음성만 내보내고 끝낸다 (대화 기록에도 남기지 않는다)
++        _t_stop0 = time.monotonic()
+         pre_stt = None
+         if PIPE_STOP_WORDS and CANNED_TEXTS.get("stop") and not img_bytes:
+             _stop_src = text_in
+@@ -7324,6 +7540,7 @@
+                 logging.info("[pipe] '그만' 감지(%r) - 모델 호출 없이 저장된 음성으로 응답", _stop_src[:20])
+                 return _pipe_say_response(tid, "stop", user_text=_stop_src, stop=True)
+ 
++        _t_stop1 = time.monotonic()
+         _kiss_new_turn(tid)      # 이전 턴의 '자위해봐' 상태 정리
+         if text_in:
+             _kiss_arm_if_requested(tid, text_in)      # 글자로 보낸 '자위해봐'는 바로 판정 (음성 입력은 받아쓰기가 끝나는 대로 아래에서 판정)
+@@ -7333,28 +7550,39 @@
+         auth_hdr = request.headers.get("Authorization", "")    # 함수 내부 호출에 그대로 전달 (로그인 사용 시)
+         use_model_tags = bool(PIPE_MODEL_TAGS and _tts_ext_ready())
+         recall_block = None      # 지금 한 말과 비슷한 기억을 턴마다 인출 (실패/미준비면 None -> 예전 방식)
+-        if RECALL_ENABLED and OWNER_USER_ID is not None:
+-            try:
+-                _rq = _recall_query(text_in, data.get("turns"))
+-                if _rq:
+-                    recall_block = _pipe_executor.submit(build_recall_block, _rq).result(timeout=RECALL_TIMEOUT_S)
++        if recall_fut is not None:
++            try:      # 위에서 이미 시작해 둔 인출을 기다린다 (제한 시간은 시작한 때부터 재되, 최소 0.3초는 더 기다린다)
++                recall_block = recall_fut.result(timeout=max(0.3, RECALL_TIMEOUT_S - (time.monotonic() - _t_recall0)))
+             except Exception as e:
+                 logging.warning("[recall] 대기 시간 초과/오류 - 예전 방식으로 진행: %s", type(e).__name__)
+                 recall_block = None
++        _t_rec1 = time.monotonic()
+         try:
+-            system_prompt = build_system_prompt(
+-                voice_history=ctx, location_label=get_location_label(lat, lng),
+-                eleven_voice=_tts_ext_ready() and not use_model_tags,   # 모델 태그 모드에서는 아래 PIPE_STYLE_NOTE가 대신한다
+-                recall_block=recall_block,
+-            ) + "\n\n" + (PIPE_STYLE_NOTE + "\n\n" if use_model_tags else "") \
+-              + (PIPE_VARIETY_NOTE + "\n\n" if PIPE_VARIETY_NOTE else "") + _pipe_note() \
+-              + ("\n\n" + PIPE_NAVER_NOTE if PIPE_NAVER_ENABLED else "")
++            _pipe_notes = (PIPE_STYLE_NOTE + "\n\n" if use_model_tags else "") \
++                + (PIPE_VARIETY_NOTE + "\n\n" if PIPE_VARIETY_NOTE else "") + _pipe_note() \
++                + ("\n\n" + PIPE_NAVER_NOTE if PIPE_NAVER_ENABLED else "")
++            if PIPE_CACHE_ORDER:
++                # 입출력/글자 표현 안내는 안 바뀌는 앞부분에 두고(캐시), 기억/대화 기록/시각은 뒤로 보낸다. 우선순위 문구는 맨 끝에 한 줄로 다시 붙인다
++                system_prompt = build_system_prompt(
++                    voice_history=ctx, location_label=get_location_label(lat, lng),
++                    eleven_voice=_tts_ext_ready() and not use_model_tags,
++                    recall_block=recall_block, cache_order=True, static_tail=_pipe_notes,
++                    tail_reminder=PIPE_TAIL_REMINDER)
++                logging.info("[pipe] 시스템 프롬프트 고정 앞부분 %d자(해시 %s) / 전체 %d자 - 해시가 매번 같아야 캐시가 걸립니다",
++                             _SYSPROMPT_PREFIX_INFO["len"], _SYSPROMPT_PREFIX_INFO["hash"], len(system_prompt))
++            else:
++                system_prompt = build_system_prompt(
++                    voice_history=ctx, location_label=get_location_label(lat, lng),
++                    eleven_voice=_tts_ext_ready() and not use_model_tags,   # 모델 태그 모드에서는 아래 PIPE_STYLE_NOTE가 대신한다
++                    recall_block=recall_block,
++                ) + "\n\n" + _pipe_notes
+         except Exception as e:
+             logging.exception("[pipe] 시스템 프롬프트 조립 실패")
+             if CANNED_TEXTS.get("error"):
+                 return _pipe_say_response(tid, "error", warn=f"prompt build failed: {e}")
+             return jsonify({"error": f"prompt build failed: {e}"}), 500
+ 
++        _t_pr1 = time.monotonic()
+         if audio_bytes:
+             user_parts = [T.Part.from_bytes(data=audio_bytes, mime_type=mime),
+                           T.Part(text="(위는 상대가 방금 한 말의 음성이다. 한국어로 말한 것으로 알아듣고 대답해줘.)")]
+@@ -7369,6 +7597,9 @@
+         yt_match = _YT_FIND_RE.search(text_in) if (PIPE_MEDIA_REACT and YOUTUBE_ENABLED and text_in) else None
+         contents = _pipe_build_contents(data.get("turns"), user_parts)
+         t_prep = time.monotonic()
++        logging.info("[pipe] 준비 %dms = 그만확인(받아쓰기) %dms + 기억인출 대기 %dms + 프롬프트 조립 %dms (입력=%s)",
++                     int((t_prep - t_req) * 1000), int((_t_stop1 - _t_stop0) * 1000), int((_t_rec1 - _t_stop1) * 1000),
++                     int((_t_pr1 - _t_rec1) * 1000), "음성" if audio_bytes else "글자")
+ 
+         stt_future = pre_stt
+         if audio_bytes and stt_future is None:
+@@ -7407,6 +7638,24 @@
+                     _yt_block = ""
+                 if _yt_block:
+                     contents = _pipe_build_contents(data.get("turns"), list(user_parts) + [T.Part(text=_yt_block)])
++            if quick_stock_futs:
++                # 주식봇 조회: PIPE_FILLER_MS(요청 시점부터) 안에 안 끝나면 '잠시만요.'를 먼저 말하고 계속 기다린다
++                from concurrent.futures import wait as _futures_wait
++                _qs_futs = [f for _q, f in quick_stock_futs]
++                _qs_done, _qs_pending = _futures_wait(_qs_futs, timeout=max(0.3, PIPE_FILLER_MS / 1000.0 - (time.monotonic() - t_req)))
++                if _qs_pending and PIPE_FILLERS and not filler_sent:
++                    filler_sent = True
++                    yield _pipe_ev({"type": "delta", "filler": True, "text": random.choice(PIPE_FILLERS) + " "})
++                _qs_block, _qs_canned = _pipe_stock_collect(quick_stock_futs, STOCKBOT_CONNECT_TIMEOUT + STOCKBOT_TIMEOUT + 3)
++                if _qs_block:
++                    contents = _pipe_build_contents(data.get("turns"), list(user_parts) + [T.Part(text=_qs_block)])
++                elif _qs_canned and not STOCKBOT_FALLBACK and CANNED_TEXTS.get(_qs_canned):
++                    # 주식봇이 응답이 없거나 오류: 모델을 부르지 않고 미리 저장한 안내를 읽는다 (대화 기록에는 남기지 않는다)
++                    logging.info("[pipe] 주식 버튼: 주식봇 실패(%s) - 저장된 안내를 읽습니다", _qs_canned)
++                    yield _pipe_ev({"type": "delta", "filler": True, "text": CANNED_TEXTS[_qs_canned] + " "})
++                    yield _pipe_ev({"type": "done", "tid": tid, "firstMs": 0, "totalMs": 0, "model": "canned",
++                                    "filler": True, "apology": True, "canned": _qs_canned})
++                    return
+             attempts = []   # (모델, thinking 여부): 주 모델 -> 예비 모델 순. 과부하/404면 그 모델은 건너뛴다
+             for _i, _m in enumerate([PIPE_MODEL] + PIPE_FALLBACK_MODELS):
+                 if _i == 0 and PIPE_THINKING:
+@@ -7442,7 +7691,8 @@
+                                     model=_m, contents=_c,
+                                     config=_pipe_gen_config(system_prompt, _t, _s, tools_ok=_ok))
+ 
+-                            wait_s = (PIPE_FILLER_MS / 1000.0) if (PIPE_FILLERS and not filler_sent and not reply_parts) else None
++                            # '잠시만요' 기준 시간은 요청을 받은 때부터 잰다 (준비 단계가 오래 걸렸으면 모델 호출 직후 바로 말한다)
++                            wait_s = max(0.3, PIPE_FILLER_MS / 1000.0 - (time.monotonic() - t_req)) if (PIPE_FILLERS and not filler_sent and not reply_parts) else None
+                             for chunk in _pipe_iter_with_wait(_mk, wait_s):
+                                 if chunk is _PIPE_WAIT:
+                                     # 첫 글자가 늦다 -> 먼저 한마디. 화면/음성에는 나가지만 저장되는 대답에는 넣지 않는다
+@@ -7618,7 +7868,8 @@
+                     else:
+                         msg = f"{type(err).__name__}: {err}" if err else f"빈 응답 (finish_reason={finish})"
+                     logging.warning("[pipe] 응답 없음 - %s", msg)
+-                    apology = _pipe_apology_text(err)
++                    _fin0 = getattr(finish, "name", None) or (str(finish).split(".")[-1] if finish is not None else "")
++                    apology = _pipe_apology_text(err, _fin0)
+                     if apology:
+                         # 오류 문구만 보내면 아무 소리도 안 나므로, 미리 합성해 둔 사과 한마디를 필러처럼 읽게 한다 (저장되는 대답에는 넣지 않는다)
+                         yield _pipe_ev({"type": "delta", "filler": True, "text": apology + " "})
+@@ -7677,6 +7928,8 @@
+ def _warm_filler_cache():
+     time.sleep(10)      # 서버가 완전히 뜬 뒤에
+     for f in ((globals().get("PIPE_FILLERS") or []) + (globals().get("PIPE_APOLOGY_FILLERS") or [])):
++        if _canned_norm(f) in _CANNED_BY_TEXT:      # 미리 저장해 둔 음성 안내(voice_notes)가 맡는 문장은 여기서 또 만들지 않는다
++            continue
+         try:
+             with app.test_request_context("/api/tts", method="POST", json={"text": f}):
+                 key = _filler_key({"text": f})
